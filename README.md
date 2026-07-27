@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Daedie-git/offline-review/blob/HEAD/LICENSE)
 
-A VS Code extension for local branch diff review with offline inline comments. Review your own code changes before pushing — no GitHub/remote needed.
+A VS Code extension for local branch diff review and ordinary-workspace code annotation with offline inline comments. Review or annotate code before pushing — no GitHub/remote needed.
 
 > [!NOTE]
 > This project is a fork of [Gururagavendra/vscode-local-pr-reviewer](https://github.com/Gururagavendra/vscode-local-pr-reviewer). It preserves the original MIT license and copyright while publishing the fork's changes independently as `Daedie.offline-review`. GitHub hosts this fork as an independent repository rather than as a member of the upstream fork network.
@@ -53,8 +53,9 @@ Install directly from the [VS Code Marketplace](https://marketplace.visualstudio
 - **Commits Section** - View commits between base and compare branches
 - **Open File** - Quick action to open the working copy from the diff view
 - **Multiple Reviews** - Save and switch between review sessions
-- **Copilot Integration** - Query your review comments via Copilot chat using `#offlineReviewComments`
-- **Persistent Storage** - Each review has an isolated UUID-backed comment bucket under `.vscode/local-reviews/`
+- **Workspace Code Comments** - Add persistent comments in ordinary editors without creating or activating a review
+- **Copilot Integration** - Query diff comments with `#offlineReviewComments` and workspace comments with `#offlineCodeComments`
+- **Independent Storage** - Reviews keep UUID-backed v2 buckets; workspace comments use one separate v1 file under `.vscode/local-reviews/`
 
 ## Performance
 
@@ -72,6 +73,14 @@ Offline Review comments are stored offline, making Copilot queries **36x faster*
 
 Worktree selection is session-only: Offline Review never switches or opens a VS Code workspace and does not persist the selection. Review metadata and comments remain centralized under the original workspace's `.vscode/local-reviews/` directory.
 
+### Workspace code comments
+
+Open a regular file in the original Git workspace, select a line or range, and use the editor gutter's comment action. These threads appear in **Offline Review → Code Comments** even when no review is active. Linked-worktree files, virtual documents, files outside the workspace, symlink escapes, and `.vscode/local-reviews/` storage files are intentionally rejected.
+
+Workspace threads are stored in `.vscode/local-reviews/workspace-comments.json` (schema v1), independently from review comments in `.vscode/local-reviews/reviews/<review UUID>/comments.json` (schema v2). **Clear Workspace Comments** affects only the workspace file; clearing or deleting reviews never affects it. Missing files remain listed, and changed source anchors are marked stale.
+
+Use `#offlineCodeComments` to retrieve structured workspace threads with exact paths, ranges, anchors, and missing/stale status. A separate `address-code-comments` agent skill can be installed under `~/.agents/skills/address-code-comments/`; it lists unresolved threads and safely appends replies/resolves successfully addressed thread UUIDs without touching review buckets. The skill is intentionally installed outside this extension repository and is not included in the VSIX.
+
 ## Architecture
 
 ```
@@ -79,13 +88,16 @@ User
  ├── Activity Bar (Offline Review sidebar)
  │    ├── Branch Selector  — pick a linked worktree, review mode, and base branch
  │    ├── Changed Files    — grouped by directory, reviewed checkbox, comment badge
- │    ├── Comments Panel   — all threads & replies
+ │    ├── Review Comments  — persisted review comment buckets
+ │    ├── Code Comments    — ordinary-editor threads grouped by file
  │    └── Saved Reviews    — switch between review sessions
  │
- └── Diff Editor           — inline comments via VS Code Comment API
+ ├── Diff Editor           — review comments via VS Code Comment API
+ └── Regular Editor        — workspace code comments via a separate controller
 
 Copilot Chat
- └── #offlineReviewComments  — query your review comments via LM Tool
+ ├── #offlineReviewComments  — query review/diff comments
+ └── #offlineCodeComments    — query independent workspace comments
 
 Core Services
  ├── GitService       — linked worktree selection, branch list, file diffs, commit log
@@ -107,7 +119,8 @@ Core Services
 | `ChangedFilesProvider` | `src/views/` | TreeView — directories + files with badges, checkboxes, open-file action |
 | `LocalCommentsProvider` | `src/views/` | TreeView — flat list of all comment threads and replies |
 | `LocalPrsProvider` | `src/views/` | TreeView — saved review sessions |
-| `LocalReviewTool` | `src/tools/` | Copilot LM Tool — exposes comments to `#offlineReviewComments` chat queries |
+| `LocalReviewTool` | `src/tools/` | Copilot LM Tool — exposes review comments to `#offlineReviewComments` |
+| Workspace comments modules | `src/workspaceComments/` | Safe paths, atomic v1 storage, ordinary-editor controller/view, and `#offlineCodeComments` |
 
 ## Development
 

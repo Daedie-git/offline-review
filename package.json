@@ -1,8 +1,8 @@
 {
   "name": "offline-review",
   "displayName": "Offline Review",
-  "description": "Review uncommitted changes and branch diffs locally with inline comments — no remote needed.",
-  "version": "0.1.4",
+  "description": "Review diffs and annotate workspace code locally with offline inline comments — no remote needed.",
+  "version": "0.2.0",
   "publisher": "Daedie",
   "author": "Daedie",
   "icon": "resources/icon.png",
@@ -30,7 +30,7 @@
     "local"
   ],
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.95.0"
   },
   "categories": [
     "SCM Providers",
@@ -41,7 +41,8 @@
     "onView:localPrReview.branchSelector",
     "onView:localPrReview.changedFiles",
     "onView:localPrReview.localPrs",
-    "onView:localPrReview.localComments"
+    "onView:localPrReview.localComments",
+    "onView:localPrReview.codeComments"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -82,6 +83,31 @@
             }
           }
         }
+      },
+      {
+        "name": "localPrReview_getCodeComments",
+        "displayName": "Get Workspace Code Comments",
+        "toolReferenceName": "offlineCodeComments",
+        "modelDescription": "Retrieves workspace code comments stored locally by Offline Review. These comments are authored in ordinary editors and are independent of diff/review comments and active reviews. Use this tool when the user asks about workspace comments, code comments, or comments to address. It reports exact workspace-relative paths, source anchors, and missing/stale status. Do not substitute #offlineReviewComments.",
+        "icon": "$(comment-discussion)",
+        "canBeReferencedInPrompt": true,
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string",
+              "description": "Optional exact normalized workspace-relative path, for example 'src/main.ts'."
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "resolved",
+                "unresolved"
+              ],
+              "description": "Optional exact thread state filter."
+            }
+          }
+        }
       }
     ],
     "viewsContainers": {
@@ -111,6 +137,10 @@
         {
           "id": "localPrReview.localComments",
           "name": "Review Comments"
+        },
+        {
+          "id": "localPrReview.codeComments",
+          "name": "Code Comments"
         }
       ]
     },
@@ -224,6 +254,53 @@
         "command": "localPrReview.suggestChange",
         "title": "Suggest a Change",
         "icon": "$(lightbulb)"
+      },
+      {
+        "command": "localPrReview.refreshCodeComments",
+        "title": "Refresh Code Comments",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "localPrReview.clearCodeComments",
+        "title": "Clear Workspace Comments",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "localPrReview.openCodeComment",
+        "title": "Open Code Comment",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "localPrReview.addCodeComment",
+        "title": "Add Code Comment"
+      },
+      {
+        "command": "localPrReview.saveCodeComment",
+        "title": "Save"
+      },
+      {
+        "command": "localPrReview.cancelCodeComment",
+        "title": "Cancel"
+      },
+      {
+        "command": "localPrReview.editCodeComment",
+        "title": "Edit",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "localPrReview.deleteCodeComment",
+        "title": "Delete",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "localPrReview.resolveCodeComment",
+        "title": "Resolve",
+        "icon": "$(check)"
+      },
+      {
+        "command": "localPrReview.unresolveCodeComment",
+        "title": "Unresolve",
+        "icon": "$(issue-reopened)"
       }
     ],
     "menus": {
@@ -252,6 +329,16 @@
           "command": "localPrReview.refreshComments",
           "when": "view == localPrReview.localComments",
           "group": "navigation"
+        },
+        {
+          "command": "localPrReview.refreshCodeComments",
+          "when": "view == localPrReview.codeComments",
+          "group": "navigation@1"
+        },
+        {
+          "command": "localPrReview.clearCodeComments",
+          "when": "view == localPrReview.codeComments",
+          "group": "navigation@2"
         }
       ],
       "view/item/context": [
@@ -291,6 +378,21 @@
           "command": "localPrReview.suggestChange",
           "group": "inline@3",
           "when": "commentController == localPrReview && commentThread == unresolved"
+        },
+        {
+          "command": "localPrReview.addCodeComment",
+          "group": "inline",
+          "when": "commentController == localCodeComments && commentThreadIsEmpty"
+        },
+        {
+          "command": "localPrReview.saveCodeComment",
+          "group": "inline@1",
+          "when": "commentController == localCodeComments"
+        },
+        {
+          "command": "localPrReview.cancelCodeComment",
+          "group": "inline@2",
+          "when": "commentController == localCodeComments"
         }
       ],
       "comments/comment/title": [
@@ -303,6 +405,16 @@
           "command": "localPrReview.deleteComment",
           "group": "inline@2",
           "when": "commentController == localPrReview && comment == canEdit"
+        },
+        {
+          "command": "localPrReview.editCodeComment",
+          "group": "inline@1",
+          "when": "commentController == localCodeComments && comment == canEdit"
+        },
+        {
+          "command": "localPrReview.deleteCodeComment",
+          "group": "inline@2",
+          "when": "commentController == localCodeComments && comment == canEdit"
         }
       ],
       "comments/commentThread/title": [
@@ -315,6 +427,16 @@
           "command": "localPrReview.unresolveThread",
           "group": "inline@1",
           "when": "commentController == localPrReview && commentThread == resolved"
+        },
+        {
+          "command": "localPrReview.resolveCodeComment",
+          "group": "inline@1",
+          "when": "commentController == localCodeComments && commentThread == unresolved"
+        },
+        {
+          "command": "localPrReview.unresolveCodeComment",
+          "group": "inline@1",
+          "when": "commentController == localCodeComments && commentThread == resolved"
         }
       ]
     }
@@ -334,7 +456,7 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/uuid": "^10.0.0",
-    "@types/vscode": "^1.85.0",
+    "@types/vscode": "^1.95.0",
     "@typescript-eslint/eslint-plugin": "^8.65.0",
     "@typescript-eslint/parser": "^8.65.0",
     "@vscode/vsce": "^3.7.1",

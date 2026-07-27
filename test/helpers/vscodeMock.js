@@ -96,6 +96,18 @@ class MarkdownString {
     }
 }
 
+class LanguageModelTextPart {
+    constructor(value) {
+        this.value = value;
+    }
+}
+
+class LanguageModelToolResult {
+    constructor(content) {
+        this.content = content;
+    }
+}
+
 class TreeItem {
     constructor(label, collapsibleState = 0) {
         this.label = label;
@@ -118,6 +130,7 @@ class ThemeColor {
 }
 
 const createdCommentThreads = [];
+const createdCommentControllers = [];
 
 const vscode = {
     Disposable,
@@ -126,6 +139,8 @@ const vscode = {
     Position,
     Range,
     MarkdownString,
+    LanguageModelTextPart,
+    LanguageModelToolResult,
     TreeItem,
     ThemeIcon,
     ThemeColor,
@@ -142,8 +157,10 @@ const vscode = {
         },
     },
     comments: {
-        createCommentController() {
-            return {
+        createCommentController(id, label) {
+            const controller = {
+                id,
+                label,
                 options: undefined,
                 commentingRangeProvider: undefined,
                 createCommentThread(uri, range, comments) {
@@ -161,9 +178,12 @@ const vscode = {
                 },
                 dispose() {},
             };
+            createdCommentControllers.push(controller);
+            return controller;
         },
     },
     __createdCommentThreads: createdCommentThreads,
+    __createdCommentControllers: createdCommentControllers,
     window: {
         showErrorMessage() {},
         showWarningMessage() {},
@@ -185,6 +205,7 @@ function installVscodeMock(workspaceRoot) {
         : [];
     vscode.workspace.textDocuments = [];
     createdCommentThreads.length = 0;
+    createdCommentControllers.length = 0;
     if (!installed) {
         originalLoad = Module._load;
         Module._load = function patchedLoad(request, parent, isMain) {

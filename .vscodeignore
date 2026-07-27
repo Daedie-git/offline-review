@@ -3,6 +3,8 @@
 src/**
 test/**
 *.vsix
+**/__pycache__/**
+**/*.py[cod]
 bug.md
 review-*.md
 .gitignore

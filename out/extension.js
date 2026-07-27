@@ -50,6 +50,11 @@ const localReviewTool_1 = require("./tools/localReviewTool");
 const fileDecorationProvider_1 = require("./decorations/fileDecorationProvider");
 const suggestChangePanel_1 = require("./views/suggestChangePanel");
 const virtualDocLanguageFeatures_1 = require("./language/virtualDocLanguageFeatures");
+const pathResolver_1 = require("./workspaceComments/pathResolver");
+const storage_1 = require("./workspaceComments/storage");
+const controller_1 = require("./workspaceComments/controller");
+const provider_1 = require("./workspaceComments/provider");
+const tool_1 = require("./workspaceComments/tool");
 const types_1 = require("./types");
 async function activate(context) {
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -60,6 +65,10 @@ async function activate(context) {
     const gitService = new gitService_1.GitService(context);
     const localPrManager = new localPrManager_1.LocalPrManager(gitService, workspaceRoot);
     const storageService = new storageService_1.StorageService(localPrManager);
+    const workspacePathResolver = new pathResolver_1.WorkspacePathResolver(workspaceRoot);
+    const workspaceCommentStorage = new storage_1.WorkspaceCommentStorage(workspaceRoot, workspacePathResolver);
+    const workspaceCommentController = new controller_1.WorkspaceCommentController(workspaceCommentStorage, workspacePathResolver);
+    const workspaceCommentsProvider = new provider_1.WorkspaceCommentsProvider(workspaceCommentStorage, workspacePathResolver);
     const gitFileContentProvider = new gitFileContentProvider_1.GitFileContentProvider(gitService);
     context.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider('git-local-review', gitFileContentProvider));
     (0, virtualDocLanguageFeatures_1.registerVirtualDocLanguageFeatures)(context, gitService);
@@ -71,11 +80,23 @@ async function activate(context) {
     const fileDecorationProvider = new fileDecorationProvider_1.ReviewFileDecorationProvider(storageService, gitService);
     context.subscriptions.push(vscode.window.registerFileDecorationProvider(fileDecorationProvider));
     try {
+        workspaceCommentController.loadAllThreads();
+    }
+    catch (error) {
+        vscode.window.showErrorMessage(`Workspace code comments could not be loaded: ${errorMessage(error)}`);
+    }
+    try {
         const localReviewTool = new localReviewTool_1.LocalReviewTool(gitService, localPrManager, storageService);
         context.subscriptions.push(vscode.lm.registerTool('localPrReview_getComments', localReviewTool));
     }
     catch {
         // The Language Model API is optional.
+    }
+    try {
+        context.subscriptions.push(vscode.lm.registerTool('localPrReview_getCodeComments', new tool_1.WorkspaceCommentsTool(workspaceCommentStorage, workspacePathResolver)));
+    }
+    catch {
+        // Register independently so one optional tool cannot disable the other.
     }
     context.subscriptions.push(vscode.window.registerWebviewViewProvider(branchSelectorWebviewProvider_1.BranchSelectorWebviewProvider.viewType, branchSelectorProvider));
     const changedFilesTreeView = vscode.window.createTreeView('localPrReview.changedFiles', {
@@ -93,6 +114,8 @@ async function activate(context) {
         treeDataProvider: localPrsProvider,
     }), vscode.window.createTreeView('localPrReview.localComments', {
         treeDataProvider: localCommentsProvider,
+    }), vscode.window.createTreeView('localPrReview.codeComments', {
+        treeDataProvider: workspaceCommentsProvider,
     }));
     const initialized = await gitService.initialize();
     if (!initialized) {
@@ -521,6 +544,39 @@ async function activate(context) {
     context.subscriptions.push({
         dispose: () => commentsWatchTimer && clearTimeout(commentsWatchTimer),
     });
+    let workspaceCommentsWatchTimer;
+    const reloadWorkspaceComments = () => {
+        try {
+            workspaceCommentController.loadAllThreads();
+            workspaceCommentsProvider.refresh();
+        }
+        catch (error) {
+            vscode.window.showErrorMessage(`Workspace code comments could not be reloaded: ${errorMessage(error)}`);
+        }
+    };
+    const onWorkspaceCommentsChanged = (uri) => {
+        const schedule = (delay) => {
+            if (workspaceCommentsWatchTimer) {
+                clearTimeout(workspaceCommentsWatchTimer);
+            }
+            workspaceCommentsWatchTimer = setTimeout(() => {
+                if (!workspaceCommentStorage.shouldIgnoreWatch(uri.fsPath)) {
+                    reloadWorkspaceComments();
+                }
+            }, delay);
+        };
+        if (workspaceCommentStorage.shouldIgnoreWatch(uri.fsPath)) {
+            schedule(workspaceCommentStorage.msUntilWatchAllowed() + 50);
+        }
+        else {
+            schedule(400);
+        }
+    };
+    const workspaceCommentsWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(workspaceRoot, '.vscode/local-reviews/workspace-comments.json'));
+    context.subscriptions.push(workspaceCommentsWatcher, workspaceCommentsWatcher.onDidChange(onWorkspaceCommentsChanged), workspaceCommentsWatcher.onDidCreate(onWorkspaceCommentsChanged), workspaceCommentsWatcher.onDidDelete(onWorkspaceCommentsChanged), {
+        dispose: () => workspaceCommentsWatchTimer
+            && clearTimeout(workspaceCommentsWatchTimer),
+    });
     context.subscriptions.push(vscode.commands.registerCommand('localPrReview.createReview', async () => {
         if (branchSelectorProvider.getMode() === 'uncommitted') {
             await reviewUncommitted();
@@ -744,6 +800,130 @@ async function activate(context) {
             refreshCommentUi();
         }
     }));
+    const refreshWorkspaceCommentUi = () => {
+        workspaceCommentsProvider.refresh();
+    };
+    const reportWorkspaceCommentFailure = (operation, error) => {
+        vscode.window.showErrorMessage(`Failed to ${operation} workspace code comment: ${errorMessage(error)}`);
+        reloadWorkspaceComments();
+    };
+    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.addCodeComment', async (reply) => {
+        try {
+            await addOrReplyWorkspaceComment(workspaceCommentController, reply);
+            refreshWorkspaceCommentUi();
+        }
+        catch (error) {
+            reportWorkspaceCommentFailure('add', error);
+        }
+    }), vscode.commands.registerCommand('localPrReview.saveCodeComment', async (reply) => {
+        try {
+            const editing = reply.thread.comments.find(comment => comment.mode === vscode.CommentMode.Editing);
+            if (editing) {
+                workspaceCommentController.saveEditedComment(reply.thread, editing, reply.text ?? '');
+            }
+            else {
+                await addOrReplyWorkspaceComment(workspaceCommentController, reply);
+            }
+            refreshWorkspaceCommentUi();
+        }
+        catch (error) {
+            reportWorkspaceCommentFailure('save', error);
+        }
+    }), vscode.commands.registerCommand('localPrReview.cancelCodeComment', (reply) => {
+        if (reply.thread.comments.length === 0) {
+            reply.thread.dispose();
+        }
+    }), vscode.commands.registerCommand('localPrReview.resolveCodeComment', (thread) => {
+        try {
+            workspaceCommentController.resolveThread(thread);
+            refreshWorkspaceCommentUi();
+        }
+        catch (error) {
+            reportWorkspaceCommentFailure('resolve', error);
+        }
+    }), vscode.commands.registerCommand('localPrReview.unresolveCodeComment', (thread) => {
+        try {
+            workspaceCommentController.unresolveThread(thread);
+            refreshWorkspaceCommentUi();
+        }
+        catch (error) {
+            reportWorkspaceCommentFailure('unresolve', error);
+        }
+    }), vscode.commands.registerCommand('localPrReview.editCodeComment', (comment) => {
+        const thread = comment.thread
+            ?? comment.parent
+            ?? workspaceCommentController.findThreadForComment(comment);
+        if (!thread) {
+            reportWorkspaceCommentFailure('edit', new Error('The comment is stale or no longer available'));
+            return;
+        }
+        for (const candidate of thread.comments) {
+            candidate.mode = candidate === comment
+                ? vscode.CommentMode.Editing
+                : vscode.CommentMode.Preview;
+        }
+        thread.comments = [...thread.comments];
+    }), vscode.commands.registerCommand('localPrReview.deleteCodeComment', async (comment) => {
+        const thread = comment.thread
+            ?? comment.parent
+            ?? workspaceCommentController.findThreadForComment(comment);
+        if (!thread) {
+            reportWorkspaceCommentFailure('delete', new Error('The comment is stale or no longer available'));
+            return;
+        }
+        const answer = await vscode.window.showWarningMessage('Delete this workspace code comment?', { modal: true }, 'Delete');
+        if (answer === 'Delete') {
+            try {
+                workspaceCommentController.deleteComment(thread, comment);
+                refreshWorkspaceCommentUi();
+            }
+            catch (error) {
+                reportWorkspaceCommentFailure('delete', error);
+            }
+        }
+    }), vscode.commands.registerCommand('localPrReview.refreshCodeComments', () => {
+        reloadWorkspaceComments();
+    }), vscode.commands.registerCommand('localPrReview.clearCodeComments', async () => {
+        try {
+            if (workspaceCommentStorage.load().threads.length === 0) {
+                vscode.window.showInformationMessage('No workspace code comments to clear.');
+                return;
+            }
+            const answer = await vscode.window.showWarningMessage('Clear all workspace code comments? Review comments are not affected.', { modal: true }, 'Clear');
+            if (answer === 'Clear') {
+                workspaceCommentStorage.clear();
+                reloadWorkspaceComments();
+            }
+        }
+        catch (error) {
+            reportWorkspaceCommentFailure('clear', error);
+        }
+    }), vscode.commands.registerCommand('localPrReview.openCodeComment', async (item) => {
+        try {
+            const report = workspaceCommentStorage.getReports().find(candidate => candidate.id === item.report.id);
+            if (!report || report.filePath !== item.report.filePath) {
+                throw new Error('That workspace code comment is stale or has moved');
+            }
+            if (report.pathStatus !== 'current' || report.rangeStatus === 'outOfRange') {
+                throw new Error('That workspace code comment file or range is unavailable');
+            }
+            const uri = workspacePathResolver.uriForStoredPath(report.filePath);
+            if (!uri) {
+                throw new Error('That workspace code comment file is unavailable');
+            }
+            const document = await vscode.workspace.openTextDocument(uri);
+            if (report.startLine >= document.lineCount || report.endLine >= document.lineCount) {
+                throw new Error('That workspace code comment range is outside the document');
+            }
+            const editor = await vscode.window.showTextDocument(document);
+            const range = new vscode.Range(report.startLine, 0, report.endLine, document.lineAt(report.endLine).range.end.character);
+            editor.selection = new vscode.Selection(range.start, range.end);
+            editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+        }
+        catch (error) {
+            reportWorkspaceCommentFailure('open', error);
+        }
+    }));
     context.subscriptions.push(vscode.commands.registerCommand('localPrReview.refreshPrs', () => {
         localPrsProvider.refresh();
     }), vscode.commands.registerCommand('localPrReview.refreshComments', () => {
@@ -802,7 +982,7 @@ async function activate(context) {
             localCommentsProvider.refresh();
         }
     }));
-    context.subscriptions.push(branchSelectorProvider, changedFilesProvider, localPrsProvider, localCommentsProvider, commentController, gitFileContentProvider, fileDecorationProvider, { dispose: () => localPrManager.dispose() });
+    context.subscriptions.push(branchSelectorProvider, changedFilesProvider, localPrsProvider, localCommentsProvider, commentController, workspaceCommentsProvider, workspaceCommentController, gitFileContentProvider, fileDecorationProvider, { dispose: () => localPrManager.dispose() });
 }
 function addOrReply(controller, reply) {
     const thread = reply.thread;
@@ -817,6 +997,14 @@ function addOrReply(controller, reply) {
     else {
         controller.addReply(thread, reply.text ?? '');
     }
+}
+async function addOrReplyWorkspaceComment(controller, reply) {
+    if (reply.thread.comments.length > 0) {
+        controller.addReply(reply.thread, reply.text ?? '');
+        return;
+    }
+    const document = await vscode.workspace.openTextDocument(reply.thread.uri);
+    controller.createThread(document, reply.thread.range ?? new vscode.Range(0, 0, 0, 0), reply.text ?? '', reply.thread);
 }
 function extractFilePath(uri) {
     if (uri.scheme === 'file') {

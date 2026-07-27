@@ -1,0 +1,44 @@
+import { WorkspacePathResolver } from './pathResolver';
+import { WorkspaceComment, WorkspaceCommentsFile, WorkspaceCommentThread, WorkspaceThreadReport } from './types';
+export declare class WorkspaceCommentStorage {
+    private readonly pathResolver;
+    readonly filePath: string;
+    readonly lockPath: string;
+    _lastWrittenHash: string | undefined;
+    private suppressWatcherUntil;
+    private ignoreWatchDepth;
+    constructor(_workspaceRoot: string, pathResolver: WorkspacePathResolver);
+    load(): WorkspaceCommentsFile;
+    getReports(): WorkspaceThreadReport[];
+    addThread(filePath: string, startLine: number, endLine: number, sourceAnchor: string, body: string, author: string): WorkspaceCommentThread;
+    addReply(threadId: string, body: string, author: string): WorkspaceComment;
+    editComment(threadId: string, commentId: string, body: string): void;
+    /** Delete one comment and report whether its now-empty thread was removed. */
+    deleteComment(threadId: string, commentId: string): boolean;
+    resolveThread(threadId: string): void;
+    unresolveThread(threadId: string): void;
+    clear(): void;
+    shouldIgnoreWatch(fsPath?: string): boolean;
+    msUntilWatchAllowed(): number;
+    private setThreadState;
+    private mutate;
+    private loadSnapshot;
+    private recoveryEntries;
+    private recoverInterruptedSave;
+    private readAndValidate;
+    private save;
+    private deleteExpected;
+    private displaceAndVerify;
+    private assertExpectedFingerprint;
+    private ensureSafeStorageDirectory;
+    private openVerifiedDirectory;
+    private revalidateStorage;
+    private verifyStorageDirectory;
+    private storageDirectoryStillCurrent;
+    private entryPath;
+    private guardedOperation;
+    private guardedUnlink;
+    private markOwnWrite;
+    private readAnchor;
+}
+export declare function isWorkspaceCommentsFile(value: unknown, pathResolver: WorkspacePathResolver): value is WorkspaceCommentsFile;
