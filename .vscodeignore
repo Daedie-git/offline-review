@@ -1,7 +1,12 @@
 .vscode/**
 .grok/**
+src/**
+test/**
 *.vsix
 bug.md
 .gitignore
+eslint.config.js
+package-lock.json
+tsconfig.json
 resources/screenshots/**
 resources/graphs/**

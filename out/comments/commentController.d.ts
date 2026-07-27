@@ -1,40 +1,38 @@
 import * as vscode from 'vscode';
 import { StorageService } from '../storage/storageService';
-import { GitService } from '../git/gitService';
+import { DiffPlan } from '../types';
 export declare class ReviewCommentController {
-    private storageService;
-    private controller;
-    private threads;
-    private gitService;
-    private reviewableFiles;
+    private readonly storageService;
+    private readonly controller;
+    private readonly threads;
+    private readonly commentIdentities;
+    private readonly reviewableFiles;
+    private activePlan;
     constructor(storageService: StorageService);
+    setReviewableFiles(filePaths: readonly string[]): void;
+    /** Load one file's threads only on the exact modified/right URI. */
+    loadThreadsForFile(targetUri: vscode.Uri, filePath: string, plan?: DiffPlan | undefined): void;
     /**
-     * Set the list of file paths (workspace-relative) that are part of the active review.
-     * This enables commenting on working-tree files shown in diffs.
+     * Replace all loaded threads using the exact target document in a prepared
+     * plan. No branch equality or checked-out-branch inference is performed.
      */
-    setReviewableFiles(filePaths: string[]): void;
-    /**
-     * Check if any loaded threads reference this file path.
-     */
-    private hasThreadsForFile;
-    /**
-     * Load comment threads from storage for a given file in the diff view.
-     * Creates additional threads on the diff URI so inline comments show in the diff editor.
-     */
-    loadThreadsForFile(fileUri: vscode.Uri, filePath: string): void;
-    /**
-     * Load all threads for the active review across all files
-     */
-    loadAllThreads(gitService?: GitService, sourceBranch?: string, targetBranch?: string): Promise<void>;
-    private loadAllThreadsForBranches;
-    createThread(uri: vscode.Uri, range: vscode.Range, text: string, filePath: string, existingThread?: vscode.CommentThread): void;
+    loadAllThreads(plan?: DiffPlan): void;
+    /** Capture ownership before opening any delayed new-comment UI. */
+    captureNewThreadReviewId(uri: vscode.Uri, filePath: string): string;
+    createThread(uri: vscode.Uri, range: vscode.Range, text: string, filePath: string, existingThread?: vscode.CommentThread, expectedReviewId?: string): void;
+    private requireCurrentCommentTarget;
     private populateThread;
     private createVscodeThread;
+    private removeOtherUris;
+    private applyThreadState;
+    private toVscodeComments;
     private toVscodeComment;
     resolveThread(thread: vscode.CommentThread): void;
     unresolveThread(thread: vscode.CommentThread): void;
     addReply(thread: vscode.CommentThread, text: string): void;
+    saveEditedComment(thread: vscode.CommentThread, comment: vscode.Comment, newBody: string): void;
     deleteComment(thread: vscode.CommentThread, comment: vscode.Comment): void;
+    private disposeThread;
     findThreadForComment(comment: vscode.Comment): vscode.CommentThread | undefined;
     private clearAllThreads;
     dispose(): void;

@@ -7,9 +7,9 @@ interface ToolInput {
     state?: 'resolved' | 'unresolved';
 }
 export declare class LocalReviewTool implements vscode.LanguageModelTool<ToolInput> {
-    private gitService;
-    private localPrManager;
-    private storageService;
+    private readonly gitService;
+    private readonly localPrManager;
+    private readonly storageService;
     constructor(gitService: GitService, localPrManager: LocalPrManager, storageService: StorageService);
     prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<ToolInput>, _token: vscode.CancellationToken): Promise<{
         invocationMessage: string;

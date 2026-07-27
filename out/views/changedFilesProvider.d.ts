@@ -1,22 +1,23 @@
 import * as vscode from 'vscode';
-import { FileChange, CommitInfo } from '../types';
-import { GitService } from '../git/gitService';
+import { CommitInfo, DiffPlan, FileChange, LocalPr, PreparedDiffState } from '../types';
+import { FileDiffUris, GitService } from '../git/gitService';
 import { StorageService } from '../storage/storageService';
 import { LocalPrManager } from '../services/localPrManager';
 export type ChangedFileTreeItem = SectionItem | FolderItem | FileChangeItem | CommitItem | MessageItem;
 export declare class ChangedFilesProvider implements vscode.TreeDataProvider<ChangedFileTreeItem> {
-    private gitService;
-    private storageService;
-    private localPrManager;
-    private _onDidChangeTreeData;
+    private readonly gitService;
+    private readonly storageService;
+    private readonly localPrManager;
+    private readonly _onDidChangeTreeData;
     readonly onDidChangeTreeData: vscode.Event<ChangedFileTreeItem | undefined>;
     private files;
     private commits;
-    private sourceBranch;
-    private targetBranch;
+    private plan;
+    private preparedState;
     private reviewedFiles;
     private filesSection;
     private commitsSection;
+    private requestGeneration;
     constructor(gitService: GitService, storageService: StorageService, localPrManager: LocalPrManager);
     getTreeItem(element: ChangedFileTreeItem): vscode.TreeItem;
     getChildren(element?: ChangedFileTreeItem): ChangedFileTreeItem[];
@@ -27,24 +28,31 @@ export declare class ChangedFilesProvider implements vscode.TreeDataProvider<Cha
     private createFileItem;
     private getCommentCounts;
     setFileReviewed(filePath: string, checked: boolean): void;
-    refresh(sourceBranch: string, targetBranch: string): Promise<void>;
+    /**
+     * Resolve and query a review without changing visible provider state. This is
+     * the async half used by an extension coordinator before an atomic apply.
+     */
+    prepareRefresh(input: LocalPr | DiffPlan): Promise<PreparedDiffState>;
+    /**
+     * Synchronously publish a prepared state and invalidate older async refreshes.
+     * Coordinators can apply this and then update comments/decorations as one turn.
+     */
+    applyPreparedState(state: PreparedDiffState): void;
+    /** Prepare and apply unless a newer request supersedes this one. */
+    refresh(input: LocalPr | DiffPlan): Promise<boolean>;
+    private commitPreparedState;
+    getPreparedState(): PreparedDiffState | undefined;
+    getDiffPlan(): DiffPlan | undefined;
     getAllExpandableItems(): ChangedFileTreeItem[];
     getAllFileItems(): FileChangeItem[];
-    /**
-     * Get all changed file paths directly (not dependent on tree rendering).
-     */
     getAllFilePaths(): string[];
-    getBranches(): {
-        source: string;
-        target: string;
-    };
     clear(): void;
     fireChange(): void;
     dispose(): void;
 }
 export declare class SectionItem extends vscode.TreeItem {
     readonly sectionType: 'files' | 'commits';
-    private children;
+    private readonly children;
     constructor(label: string, sectionType: 'files' | 'commits', children: ChangedFileTreeItem[], count: number, collapsibleState?: vscode.TreeItemCollapsibleState);
     getChildren(): ChangedFileTreeItem[];
 }
@@ -55,10 +63,11 @@ export declare class FolderItem extends vscode.TreeItem {
 }
 export declare class FileChangeItem extends vscode.TreeItem {
     readonly fileChange: FileChange;
-    readonly sourceBranch: string;
-    readonly targetBranch: string;
+    readonly diffPlan: DiffPlan;
     readonly commentCount: number;
-    constructor(fileChange: FileChange, sourceBranch: string, targetBranch: string, commentCount?: number, useBasename?: boolean);
+    readonly leftUri: vscode.Uri;
+    readonly rightUri: vscode.Uri;
+    constructor(fileChange: FileChange, diffPlan: DiffPlan, uris: FileDiffUris, commentCount?: number, useBasename?: boolean);
 }
 export declare class CommitItem extends vscode.TreeItem {
     readonly commit: CommitInfo;

@@ -35,36 +35,37 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.BranchSelectorProvider = void 0;
 const vscode = __importStar(require("vscode"));
+const types_1 = require("../types");
 class BranchSelectorProvider {
     constructor(gitService, localPrManager) {
         this.gitService = gitService;
         this.localPrManager = localPrManager;
         this._onDidChangeTreeData = new vscode.EventEmitter();
         this.onDidChangeTreeData = this._onDidChangeTreeData.event;
-        this.sourceBranch = 'origin/devel';
+        this.sourceBranch = '';
         this.targetBranch = '';
-        // Sync with active review
-        const active = this.localPrManager.getActiveReview();
-        if (active) {
-            this.sourceBranch = active.sourceBranch;
-            this.targetBranch = active.targetBranch;
-        }
+        this.mode = localPrManager.getActiveMode();
+        this.syncFromActiveReview();
     }
     getTreeItem(element) {
         return element;
     }
     getChildren() {
+        if (this.mode === 'uncommitted') {
+            return [new BranchSelectorItem('Uncommitted', this.targetBranch || '(current checkout)', 'localPrReview.reviewUncommitted', 'HEAD vs working tree')];
+        }
+        const selfDescription = this.sourceBranch
+            && this.sourceBranch === this.targetBranch
+            ? 'intentional empty self-review'
+            : undefined;
         return [
-            new BranchSelectorItem('Base', this.sourceBranch || '(select base branch)', 'localPrReview.selectSource'),
-            new BranchSelectorItem('Compare', this.targetBranch || '(select compare branch)', 'localPrReview.selectDestination'),
+            new BranchSelectorItem('Base', this.sourceBranch || '(select base branch)', 'localPrReview.reviewActiveBranch'),
+            new BranchSelectorItem('Active branch', this.targetBranch || '(current checkout)', 'localPrReview.reviewActiveBranch', selfDescription),
         ];
     }
-    getSourceBranch() {
-        return this.sourceBranch;
-    }
-    getTargetBranch() {
-        return this.targetBranch;
-    }
+    getSourceBranch() { return this.sourceBranch; }
+    getTargetBranch() { return this.targetBranch; }
+    getMode() { return this.mode; }
     setSourceBranch(branch) {
         this.sourceBranch = branch;
         this._onDidChangeTreeData.fire(undefined);
@@ -73,30 +74,40 @@ class BranchSelectorProvider {
         this.targetBranch = branch;
         this._onDidChangeTreeData.fire(undefined);
     }
-    refresh() {
-        const active = this.localPrManager.getActiveReview();
-        if (active) {
-            this.sourceBranch = active.sourceBranch;
-            this.targetBranch = active.targetBranch;
-        }
+    setMode(mode) {
+        this.mode = mode;
         this._onDidChangeTreeData.fire(undefined);
     }
+    refresh() {
+        this.syncFromActiveReview();
+        this._onDidChangeTreeData.fire(undefined);
+    }
+    syncFromActiveReview() {
+        const active = this.localPrManager.getActiveReview();
+        if (!active) {
+            return;
+        }
+        const comparison = (0, types_1.getReviewSourceTarget)(active);
+        this.mode = active.mode;
+        this.sourceBranch = active.mode === 'branch'
+            ? active.baseBranch
+            : (this.localPrManager.getPreferredBaseBranch() ?? '');
+        this.targetBranch = comparison.targetBranch;
+    }
     dispose() {
+        // Retain the service dependency in this lightweight tree implementation;
+        // the webview provider is the primary selector UI.
+        void this.gitService;
         this._onDidChangeTreeData.dispose();
     }
 }
 exports.BranchSelectorProvider = BranchSelectorProvider;
 class BranchSelectorItem extends vscode.TreeItem {
-    constructor(label, branchName, commandId) {
+    constructor(label, branchName, commandId, detail) {
         super(label, vscode.TreeItemCollapsibleState.None);
-        this.label = label;
-        this.branchName = branchName;
-        this.description = branchName;
-        this.tooltip = `Click to change ${label.toLowerCase()} branch`;
-        this.command = {
-            command: commandId,
-            title: `Select ${label} Branch`,
-        };
+        this.description = detail ? `${branchName} · ${detail}` : branchName;
+        this.tooltip = detail ?? `Click to review ${branchName}`;
+        this.command = { command: commandId, title: label };
         this.iconPath = new vscode.ThemeIcon('git-branch');
     }
 }

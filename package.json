@@ -1,8 +1,8 @@
 {
   "name": "offline-review",
   "displayName": "Offline Review",
-  "description": "Review uncommitted changes and branch diffs locally with inline comments \u2014 no remote needed.",
-  "version": "0.1.0",
+  "description": "Review uncommitted changes and branch diffs locally with inline comments — no remote needed.",
+  "version": "0.1.2",
   "publisher": "Daedie",
   "author": "Daedie",
   "icon": "resources/icon.png",
@@ -62,7 +62,7 @@
         "name": "localPrReview_getComments",
         "displayName": "Get Offline Review Comments",
         "toolReferenceName": "offlineReviewComments",
-        "modelDescription": "Retrieves local code review comments stored by the 'Offline Review' VS Code extension. This is NOT related to GitHub Pull Requests or any remote service. These are offline, local-only review comments that users create in diff views within VS Code. Call this tool when the user mentions: local comments, local review, review comments, self-review, check comments, local PR comments. The tool auto-detects the active review from the current git branch. If no review exists, tell the user to create one using the Offline Review sidebar. Do NOT search the filesystem or run terminal commands to find comments \u2014 this tool is the ONLY way to access local review comments.",
+        "modelDescription": "Retrieves local code review comments stored by the 'Offline Review' VS Code extension. This is NOT related to GitHub Pull Requests or any remote service. These are offline, local-only review comments that users create in diff views within VS Code. Call this tool when the user mentions: local comments, local review, review comments, self-review, check comments, local PR comments. The tool auto-detects the active review from the current git branch. If no review exists, tell the user to create one using the Offline Review sidebar. Do NOT search the filesystem or run terminal commands to find comments — this tool is the ONLY way to access local review comments.",
         "icon": "$(comment-discussion)",
         "canBeReferencedInPrompt": true,
         "inputSchema": {
@@ -320,18 +320,28 @@
     }
   },
   "scripts": {
+    "clean": "node -e \"require('fs').rmSync('out', { recursive: true, force: true })\"",
     "compile": "tsc -p ./",
+    "build": "npm run clean && npm run compile",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src --ext ts"
+    "typecheck": "tsc -p ./ --noEmit",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test": "node --test test/*.test.js",
+    "check": "npm run typecheck && npm run lint && npm run build && npm test",
+    "vscode:prepublish": "npm run check",
+    "package:vsix": "vsce package"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/uuid": "^10.0.0",
     "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^8.65.0",
+    "@typescript-eslint/parser": "^8.65.0",
     "@vscode/vsce": "^3.7.1",
+    "eslint": "^9.39.5",
     "typescript": "^5.3.0"
   },
   "dependencies": {
-    "uuid": "^9.0.0"
+    "uuid": "^11.1.1"
   }
 }

@@ -35,47 +35,52 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.LocalPrItem = exports.LocalPrsProvider = void 0;
 const vscode = __importStar(require("vscode"));
+const types_1 = require("../types");
 class LocalPrsProvider {
     constructor(localPrManager) {
         this.localPrManager = localPrManager;
         this._onDidChangeTreeData = new vscode.EventEmitter();
         this.onDidChangeTreeData = this._onDidChangeTreeData.event;
-        this.localPrManager.onDidChange(() => this.refresh());
+        this.managerChange = this.localPrManager.onDidChange(() => this.refresh());
     }
     getTreeItem(element) {
         return element;
     }
     getChildren() {
-        const reviews = this.localPrManager.listReviews();
         const activeId = this.localPrManager.getActiveReview()?.id;
-        return reviews.map(r => new LocalPrItem(r, r.id === activeId));
+        return this.localPrManager.listReviews().map(review => new LocalPrItem(review, review.id === activeId));
     }
     refresh() {
         this._onDidChangeTreeData.fire(undefined);
     }
     dispose() {
+        this.managerChange.dispose();
         this._onDidChangeTreeData.dispose();
     }
 }
 exports.LocalPrsProvider = LocalPrsProvider;
 class LocalPrItem extends vscode.TreeItem {
     constructor(review, isActive) {
-        const uncommitted = review.sourceBranch === review.targetBranch;
-        const label = uncommitted
-            ? `uncommitted (${review.targetBranch})`
-            : `${review.targetBranch} vs ${review.sourceBranch}`;
-        super(label, vscode.TreeItemCollapsibleState.None);
+        super((0, types_1.formatReviewLabel)(review), vscode.TreeItemCollapsibleState.None);
         this.review = review;
-        this.tooltip = `Created: ${new Date(review.createdAt).toLocaleString()}`;
-        this.contextValue = 'localPr';
-        if (isActive) {
-            this.description = 'active';
-            this.iconPath = new vscode.ThemeIcon('check', new vscode.ThemeColor('charts.green'));
+        const created = new Date(review.createdAt).toLocaleString();
+        if (review.mode === 'uncommitted') {
+            this.tooltip = `Uncommitted changes on ${review.branch}\nCreated: ${created}`;
+            this.iconPath = new vscode.ThemeIcon('git-commit');
         }
         else {
-            this.iconPath = new vscode.ThemeIcon(uncommitted ? 'git-commit' : 'git-pull-request');
+            this.tooltip = review.baseBranch === review.targetBranch
+                ? `Primary branch self-review (intentionally empty)\nCreated: ${created}`
+                : `Branch review\nCreated: ${created}`;
+            this.iconPath = new vscode.ThemeIcon('git-pull-request');
         }
-        // Click to activate
+        this.contextValue = 'localPr';
+        this.description = isActive
+            ? `active · ${review.mode}`
+            : review.mode;
+        if (isActive) {
+            this.iconPath = new vscode.ThemeIcon('check', new vscode.ThemeColor('charts.green'));
+        }
         this.command = {
             command: 'localPrReview.activateReview',
             title: 'Activate Review',

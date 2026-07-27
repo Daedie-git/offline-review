@@ -53,7 +53,7 @@ Install directly from the [VS Code Marketplace](https://marketplace.visualstudio
 - **Open File** - Quick action to open the working copy from the diff view
 - **Multiple Reviews** - Save and switch between review sessions
 - **Copilot Integration** - Query your review comments via Copilot chat using `#offlineReviewComments`
-- **Persistent Storage** - Comments saved as JSON in `.vscode/offline-review/`
+- **Persistent Storage** - Each review has an isolated UUID-backed comment bucket under `.vscode/local-reviews/`
 
 ## Performance
 
@@ -87,7 +87,7 @@ Core Services
  ├── GitService       — branch list, file diffs, commit log
  ├── CommentController — create, edit, delete, resolve threads
  ├── LocalPrManager   — review CRUD, reviewed-file state
- └── StorageService   — read/write JSON to .vscode/offline-review/
+ └── StorageService   — read/write UUID-isolated JSON under .vscode/local-reviews/
 ```
 
 ### Key modules
@@ -98,9 +98,18 @@ Core Services
 | `GitService` | `src/git/` | Wraps VS Code Git API + `child_process` for diff, branch list, commits |
 | `CommentController` | `src/comments/` | Manages all inline comment threads via the VS Code Comment API |
 | `LocalPrManager` | `src/services/` | Review CRUD — create, load, save, delete, reviewed-file state |
-| `StorageService` | `src/storage/` | Reads and writes review JSON to `.vscode/offline-review/` |
+| `StorageService` | `src/storage/` | Reads and writes UUID-isolated review JSON under `.vscode/local-reviews/` |
 | `BranchSelectorWebviewProvider` | `src/views/` | WebviewView panel for branch selection |
 | `ChangedFilesProvider` | `src/views/` | TreeView — directories + files with badges, checkboxes, open-file action |
 | `LocalCommentsProvider` | `src/views/` | TreeView — flat list of all comment threads and replies |
 | `LocalPrsProvider` | `src/views/` | TreeView — saved review sessions |
 | `LocalReviewTool` | `src/tools/` | Copilot LM Tool — exposes comments to `#offlineReviewComments` chat queries |
+
+## Development
+
+```bash
+npm ci
+npm run check
+```
+
+`npm run check` type-checks and lints the canonical TypeScript, performs a clean rebuild of `out/`, and runs the integration tests. Generated JavaScript, declarations, and source maps should only be updated through the build.

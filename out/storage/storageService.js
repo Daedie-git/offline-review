@@ -37,112 +37,116 @@ exports.StorageService = void 0;
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const crypto = __importStar(require("crypto"));
+const types_1 = require("../types");
 class StorageService {
     constructor(localPrManager) {
         this.localPrManager = localPrManager;
-        // Wall-clock ms; comments.json watcher should ignore own writes until then.
+        // Wall-clock milliseconds; comments.json watchers should ignore writes until then.
         this.suppressWatcherUntil = 0;
-        this._ignoreWatchDepth = 0;
+        this.ignoreWatchDepth = 0;
     }
     markOwnWrite(serializedContent) {
-        if (typeof serializedContent === 'string') {
-            this._lastWrittenHash = crypto.createHash('sha1').update(serializedContent).digest('hex');
-        }
-        // Short race window only; content hash is the real own-write filter.
+        this._lastWrittenHash = crypto
+            .createHash('sha1')
+            .update(serializedContent)
+            .digest('hex');
+        // The short time window handles delete/create races. The content hash is
+        // the durable own-write check and avoids dropping unrelated later edits.
         this.suppressWatcherUntil = Date.now() + 300;
-        this._ignoreWatchDepth = (this._ignoreWatchDepth || 0) + 1;
+        this.ignoreWatchDepth++;
         setTimeout(() => {
-            this._ignoreWatchDepth = Math.max(0, (this._ignoreWatchDepth || 1) - 1);
+            this.ignoreWatchDepth = Math.max(0, this.ignoreWatchDepth - 1);
         }, 0);
     }
     shouldIgnoreWatch(fsPath) {
-        if ((this._ignoreWatchDepth || 0) > 0) {
+        if (this.ignoreWatchDepth > 0) {
             return true;
         }
         if (fsPath && this._lastWrittenHash && fs.existsSync(fsPath)) {
             try {
-                const hash = crypto.createHash('sha1').update(fs.readFileSync(fsPath)).digest('hex');
+                const hash = crypto
+                    .createHash('sha1')
+                    .update(fs.readFileSync(fsPath))
+                    .digest('hex');
                 if (hash === this._lastWrittenHash) {
                     return true;
                 }
             }
             catch {
-                // fall through
+                // Fall through to the short suppression window.
             }
         }
-        return Date.now() < (this.suppressWatcherUntil || 0);
+        return Date.now() < this.suppressWatcherUntil;
     }
     msUntilWatchAllowed() {
-        return Math.max(0, (this.suppressWatcherUntil || 0) - Date.now());
+        return Math.max(0, this.suppressWatcherUntil - Date.now());
     }
     async withWatchSuppressed(fn) {
         this.suppressWatcherUntil = Date.now() + 5000;
-        this._ignoreWatchDepth = (this._ignoreWatchDepth || 0) + 1;
+        this.ignoreWatchDepth++;
         try {
             return await fn();
         }
         finally {
             setTimeout(() => {
-                this._ignoreWatchDepth = Math.max(0, (this._ignoreWatchDepth || 1) - 1);
+                this.ignoreWatchDepth = Math.max(0, this.ignoreWatchDepth - 1);
             }, 800);
         }
     }
     loadComments() {
         const review = this.localPrManager.getActiveReview();
+        return review ? this.loadCommentsForReview(review) : undefined;
+    }
+    /** Read one UUID-owned comment bucket without changing global active state. */
+    loadCommentsForReview(reviewOrId) {
+        const review = typeof reviewOrId === 'string'
+            ? this.localPrManager.getReviewById(reviewOrId)
+            : reviewOrId;
         if (!review) {
             return undefined;
         }
         const filePath = this.localPrManager.getCommentsFilePath(review);
         try {
             if (fs.existsSync(filePath)) {
-                const data = fs.readFileSync(filePath, 'utf-8');
-                return JSON.parse(data);
+                const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+                if (isCurrentCommentsFile(parsed)) {
+                    return parsed;
+                }
             }
         }
         catch {
-            // ignore parse errors
+            // An unreadable file presents an empty in-memory shell and remains
+            // untouched until the user explicitly writes to this review.
         }
-        return {
-            version: 1,
-            sourceBranch: review.sourceBranch,
-            targetBranch: review.targetBranch,
-            sourceCommit: review.sourceCommit,
-            targetCommit: review.targetCommit,
-            threads: [],
-        };
+        return this.createCommentsShell(review);
     }
-    saveComments(comments) {
-        const review = this.localPrManager.getActiveReview();
+    /** Write one explicit UUID-owned bucket without consulting active review state. */
+    saveCommentsForReview(reviewId, comments) {
+        const review = this.localPrManager.getReviewById(reviewId);
         if (!review) {
-            throw new Error('No active Offline Review — pick Uncommitted or Active branch first');
+            throw new Error(`Offline Review ${reviewId} no longer exists`);
         }
         const filePath = this.localPrManager.getCommentsFilePath(review);
-        // If no threads, delete the file and directory instead of writing empty data
+        // Empty comments remove only this review's UUID-owned file/directory.
         if (comments.threads.length === 0) {
             this.markOwnWrite('');
             if (fs.existsSync(filePath)) {
                 fs.unlinkSync(filePath);
-                const dir = path.dirname(filePath);
-                if (fs.existsSync(dir)) {
-                    const remaining = fs.readdirSync(dir);
-                    if (remaining.length === 0) {
-                        fs.rmdirSync(dir);
-                    }
+                const reviewDir = path.dirname(filePath);
+                if (fs.existsSync(reviewDir) && fs.readdirSync(reviewDir).length === 0) {
+                    fs.rmdirSync(reviewDir);
                 }
             }
             return;
         }
-        const dir = path.dirname(filePath);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
+        const reviewDir = path.dirname(filePath);
+        fs.mkdirSync(reviewDir, { recursive: true });
         const serialized = JSON.stringify(comments, null, 2);
         this.markOwnWrite(serialized);
         fs.writeFileSync(filePath, serialized, 'utf-8');
     }
-    /** Ensure the active review has a comments.json shell (empty threads ok). */
-    ensureCommentsFile() {
-        const review = this.localPrManager.getActiveReview();
+    ensureCommentsFileForReview(reviewId) {
+        const review = this.localPrManager.getReviewById(reviewId);
         if (!review) {
             return;
         }
@@ -150,26 +154,48 @@ class StorageService {
         if (fs.existsSync(filePath)) {
             return;
         }
-        const dir = path.dirname(filePath);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-        const shell = {
-            version: 1,
-            sourceBranch: review.sourceBranch,
-            targetBranch: review.targetBranch,
-            sourceCommit: review.sourceCommit,
-            targetCommit: review.targetCommit,
-            threads: [],
-        };
-        const serialized = JSON.stringify(shell, null, 2);
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        const serialized = JSON.stringify(this.createCommentsShell(review), null, 2);
         this.markOwnWrite(serialized);
         fs.writeFileSync(filePath, serialized, 'utf-8');
     }
-    addThread(filePath, startLine, endLine, body, author) {
-        const comments = this.loadComments();
+    deleteCommentsForReview(reviewId) {
+        const review = this.localPrManager.getReviewById(reviewId);
+        if (!review) {
+            return false;
+        }
+        const filePath = this.localPrManager.getCommentsFilePath(review);
+        if (!fs.existsSync(filePath)) {
+            return false;
+        }
+        this.markOwnWrite('');
+        fs.unlinkSync(filePath);
+        const reviewDir = path.dirname(filePath);
+        if (fs.existsSync(reviewDir) && fs.readdirSync(reviewDir).length === 0) {
+            fs.rmdirSync(reviewDir);
+        }
+        return true;
+    }
+    createCommentsShell(review) {
+        const comparison = (0, types_1.getReviewSourceTarget)(review);
+        return {
+            version: 2,
+            sourceBranch: comparison.sourceBranch,
+            targetBranch: comparison.targetBranch,
+            sourceCommit: comparison.sourceCommit,
+            targetCommit: comparison.targetCommit,
+            threads: [],
+        };
+    }
+    addThread(reviewId, target, filePath, startLine, endLine, body, author) {
+        const review = this.localPrManager.getReviewById(reviewId);
+        if (!review) {
+            throw new Error(`Offline Review ${reviewId} no longer exists`);
+        }
+        validateThreadTarget(review, target, filePath);
+        const comments = this.loadCommentsForReview(reviewId);
         if (!comments) {
-            throw new Error('No active review');
+            throw new Error(`Could not load Offline Review ${reviewId}`);
         }
         const thread = {
             id: crypto.randomUUID(),
@@ -183,17 +209,18 @@ class StorageService {
                     author,
                     timestamp: new Date().toISOString(),
                 }],
+            target,
         };
         comments.threads.push(thread);
-        this.saveComments(comments);
+        this.saveCommentsForReview(reviewId, comments);
         return thread;
     }
-    addReplyToThread(threadId, body, author) {
-        const comments = this.loadComments();
-        if (!comments) {
+    addReplyToThread(reviewId, threadId, body, author) {
+        const comments = this.loadCommentsForReview(reviewId);
+        if (!comments || !this.localPrManager.getReviewById(reviewId)) {
             return undefined;
         }
-        const thread = comments.threads.find(t => t.id === threadId);
+        const thread = comments.threads.find(candidate => candidate.id === threadId);
         if (!thread) {
             return undefined;
         }
@@ -204,72 +231,71 @@ class StorageService {
             timestamp: new Date().toISOString(),
         };
         thread.comments.push(comment);
-        this.saveComments(comments);
+        this.saveCommentsForReview(reviewId, comments);
         return comment;
     }
-    resolveThread(threadId) {
-        const comments = this.loadComments();
-        if (!comments) {
-            return;
-        }
-        const thread = comments.threads.find(t => t.id === threadId);
-        if (thread) {
-            thread.state = 'resolved';
-            this.saveComments(comments);
-        }
+    resolveThread(reviewId, threadId) {
+        return this.setThreadState(reviewId, threadId, 'resolved');
     }
-    unresolveThread(threadId) {
-        const comments = this.loadComments();
-        if (!comments) {
-            return;
-        }
-        const thread = comments.threads.find(t => t.id === threadId);
-        if (thread) {
-            thread.state = 'unresolved';
-            this.saveComments(comments);
-        }
+    unresolveThread(reviewId, threadId) {
+        return this.setThreadState(reviewId, threadId, 'unresolved');
     }
-    deleteComment(threadId, commentId) {
-        const comments = this.loadComments();
-        if (!comments) {
-            return;
+    setThreadState(reviewId, threadId, state) {
+        const comments = this.loadCommentsForReview(reviewId);
+        if (!comments || !this.localPrManager.getReviewById(reviewId)) {
+            return false;
         }
-        const thread = comments.threads.find(t => t.id === threadId);
+        const thread = comments.threads.find(candidate => candidate.id === threadId);
         if (!thread) {
-            return;
+            return false;
         }
-        thread.comments = thread.comments.filter(c => c.id !== commentId);
-        // If no comments left, remove the thread
+        thread.state = state;
+        this.saveCommentsForReview(reviewId, comments);
+        return true;
+    }
+    deleteComment(reviewId, threadId, commentId) {
+        const comments = this.loadCommentsForReview(reviewId);
+        if (!comments || !this.localPrManager.getReviewById(reviewId)) {
+            return false;
+        }
+        const thread = comments.threads.find(candidate => candidate.id === threadId);
+        if (!thread || !thread.comments.some(comment => comment.id === commentId)) {
+            return false;
+        }
+        thread.comments = thread.comments.filter(comment => comment.id !== commentId);
         if (thread.comments.length === 0) {
-            comments.threads = comments.threads.filter(t => t.id !== threadId);
+            comments.threads = comments.threads.filter(candidate => candidate.id !== threadId);
         }
-        this.saveComments(comments);
+        this.saveCommentsForReview(reviewId, comments);
+        return true;
     }
-    editComment(threadId, commentId, newBody) {
-        const comments = this.loadComments();
-        if (!comments) {
-            return;
+    editComment(reviewId, threadId, commentId, newBody) {
+        const comments = this.loadCommentsForReview(reviewId);
+        if (!comments || !this.localPrManager.getReviewById(reviewId)) {
+            return false;
         }
-        const thread = comments.threads.find(t => t.id === threadId);
-        if (!thread) {
-            return;
+        const thread = comments.threads.find(candidate => candidate.id === threadId);
+        const comment = thread?.comments.find(candidate => candidate.id === commentId);
+        if (!comment) {
+            return false;
         }
-        const comment = thread.comments.find(c => c.id === commentId);
-        if (comment) {
-            comment.body = newBody;
-            comment.timestamp = new Date().toISOString();
-            this.saveComments(comments);
-        }
+        comment.body = newBody;
+        comment.timestamp = new Date().toISOString();
+        this.saveCommentsForReview(reviewId, comments);
+        return true;
     }
     getAllCommentFiles() {
-        const reviews = this.localPrManager.listReviews();
+        const activeReviewId = this.localPrManager.getActiveReview()?.id;
         const files = [];
-        for (const review of reviews) {
+        for (const review of this.localPrManager.listReviews()) {
             const commentsPath = this.localPrManager.getCommentsFilePath(review);
             if (fs.existsSync(commentsPath)) {
                 files.push({
-                    reviewLabel: `${review.targetBranch} -> ${review.sourceBranch}`,
+                    reviewId: review.id,
+                    mode: review.mode,
+                    label: (0, types_1.formatReviewLabel)(review),
                     filePath: commentsPath,
+                    isActive: review.id === activeReviewId,
                 });
             }
         }
@@ -277,11 +303,72 @@ class StorageService {
     }
     getActiveReviewLabel() {
         const review = this.localPrManager.getActiveReview();
-        if (!review) {
-            return undefined;
-        }
-        return `${review.targetBranch} -> ${review.sourceBranch}`;
+        return review ? (0, types_1.formatReviewLabel)(review) : undefined;
     }
 }
 exports.StorageService = StorageService;
+function validateThreadTarget(review, target, filePath) {
+    if (!filePath || target.filePath !== filePath) {
+        throw new Error('Comment target path does not match its thread path');
+    }
+    if (review.mode === 'branch') {
+        if (target.kind !== 'git' || !isFullObjectId(target.ref)) {
+            throw new Error('Branch comments require an immutable target commit');
+        }
+        return;
+    }
+    if (target.kind !== 'worktree'
+        || target.reviewId !== review.id
+        || !isFullObjectId(target.headCommit)
+        || !isUuid(target.planId)) {
+        throw new Error('Worktree comments require their prepared review and HEAD identity');
+    }
+}
+function isFullObjectId(value) {
+    return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value);
+}
+function isUuid(value) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+function isCurrentCommentsFile(value) {
+    if (!isRecord(value)
+        || value.version !== 2
+        || typeof value.sourceBranch !== 'string'
+        || typeof value.targetBranch !== 'string'
+        || typeof value.sourceCommit !== 'string'
+        || typeof value.targetCommit !== 'string'
+        || !Array.isArray(value.threads)) {
+        return false;
+    }
+    return value.threads.every(thread => isRecord(thread)
+        && typeof thread.id === 'string'
+        && typeof thread.filePath === 'string'
+        && typeof thread.startLine === 'number'
+        && typeof thread.endLine === 'number'
+        && (thread.state === 'resolved' || thread.state === 'unresolved')
+        && Array.isArray(thread.comments)
+        && thread.comments.every(comment => isRecord(comment)
+            && typeof comment.id === 'string'
+            && typeof comment.body === 'string'
+            && typeof comment.author === 'string'
+            && typeof comment.timestamp === 'string')
+        && isCurrentThreadTarget(thread.target));
+}
+function isCurrentThreadTarget(value) {
+    if (!isRecord(value) || typeof value.filePath !== 'string') {
+        return false;
+    }
+    return value.kind === 'git'
+        ? typeof value.ref === 'string' && isFullObjectId(value.ref)
+        : value.kind === 'worktree'
+            && typeof value.reviewId === 'string'
+            && isUuid(value.reviewId)
+            && typeof value.headCommit === 'string'
+            && isFullObjectId(value.headCommit)
+            && typeof value.planId === 'string'
+            && isUuid(value.planId);
+}
+function isRecord(value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 //# sourceMappingURL=storageService.js.map

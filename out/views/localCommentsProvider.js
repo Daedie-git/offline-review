@@ -45,9 +45,7 @@ class LocalCommentsProvider {
         return element;
     }
     getChildren() {
-        const files = this.storageService.getAllCommentFiles();
-        const activeReviewLabel = this.storageService.getActiveReviewLabel();
-        return files.map(f => new CommentFileItem(f.reviewLabel, f.filePath, f.reviewLabel === activeReviewLabel));
+        return this.storageService.getAllCommentFiles().map(file => new CommentFileItem(file));
     }
     refresh() {
         this._onDidChangeTreeData.fire(undefined);
@@ -58,17 +56,22 @@ class LocalCommentsProvider {
 }
 exports.LocalCommentsProvider = LocalCommentsProvider;
 class CommentFileItem extends vscode.TreeItem {
-    constructor(reviewLabel, filePath, isActive) {
-        super(reviewLabel, vscode.TreeItemCollapsibleState.None);
-        this.filePath = filePath;
-        this.description = isActive ? 'active' : 'comments.json';
-        this.tooltip = isActive ? `${filePath} (active review)` : filePath;
-        this.iconPath = new vscode.ThemeIcon(isActive ? 'comment-discussion' : 'comment', isActive ? undefined : new vscode.ThemeColor('descriptionForeground'));
+    constructor(discovery) {
+        super(discovery.label, vscode.TreeItemCollapsibleState.None);
+        this.reviewId = discovery.reviewId;
+        this.mode = discovery.mode;
+        this.filePath = discovery.filePath;
+        const modeLabel = discovery.mode === 'uncommitted' ? 'uncommitted' : 'branch';
+        this.description = discovery.isActive ? `active · ${modeLabel}` : modeLabel;
+        this.tooltip = discovery.isActive
+            ? `${discovery.filePath} (active ${modeLabel} review)`
+            : `${discovery.filePath} (${modeLabel} review)`;
+        this.iconPath = new vscode.ThemeIcon(discovery.isActive ? 'comment-discussion' : 'comment', discovery.isActive ? undefined : new vscode.ThemeColor('descriptionForeground'));
         this.contextValue = 'commentFile';
         this.command = {
             command: 'vscode.open',
             title: 'Open Comments File',
-            arguments: [vscode.Uri.file(filePath)],
+            arguments: [vscode.Uri.file(discovery.filePath)],
         };
     }
 }

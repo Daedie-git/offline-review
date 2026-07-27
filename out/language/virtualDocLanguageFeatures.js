@@ -1,32 +1,62 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.registerVirtualDocLanguageFeatures = registerVirtualDocLanguageFeatures;
-const vscode = require("vscode");
+const vscode = __importStar(require("vscode"));
 /**
- * Forward LSP navigation from WORKTREE virtual diffs onto the real workspace file.
- * Only bridges modified-side docs — base-pane line numbers do not match disk.
+ * Forward language navigation from modified-side virtual documents to the
+ * corresponding workspace file. Original/base snapshots are never forwarded
+ * because their line positions do not describe the target file.
  */
 function registerVirtualDocLanguageFeatures(context) {
     const selector = { scheme: 'git-local-review' };
-    const isModifiedSide = (uri) => {
-        const params = new URLSearchParams(uri.query);
-        return params.get('side') === 'modified' || params.get('ref') === 'WORKTREE';
-    };
     const toRealUri = (virtualUri) => {
-        if (!isModifiedSide(virtualUri)) {
+        const params = new URLSearchParams(virtualUri.query);
+        if (params.get('side') !== 'modified' && params.get('ref') !== 'WORKTREE') {
             return undefined;
         }
         const folder = vscode.workspace.workspaceFolders?.[0];
-        if (!folder) {
-            return undefined;
-        }
-        const filePath = virtualUri.path.startsWith('/') ? virtualUri.path.slice(1) : virtualUri.path;
-        if (!filePath) {
+        const filePath = virtualUri.path.startsWith('/')
+            ? virtualUri.path.slice(1)
+            : virtualUri.path;
+        if (!folder || !filePath) {
             return undefined;
         }
         return vscode.Uri.joinPath(folder.uri, filePath);
     };
-    const ensureRealDoc = async (virtualUri) => {
+    const ensureRealUri = async (virtualUri) => {
         const realUri = toRealUri(virtualUri);
         if (!realUri) {
             return undefined;
@@ -39,23 +69,36 @@ function registerVirtualDocLanguageFeatures(context) {
             return undefined;
         }
     };
-    const forward = (command) => async (document, position) => {
-        const realUri = await ensureRealDoc(document.uri);
+    const locations = (command) => async (document, position) => {
+        const realUri = await ensureRealUri(document.uri);
         if (!realUri) {
             return undefined;
         }
         return vscode.commands.executeCommand(command, realUri, position);
     };
     context.subscriptions.push(vscode.languages.registerDefinitionProvider(selector, {
-        provideDefinition: forward('vscode.executeDefinitionProvider'),
+        provideDefinition: locations('vscode.executeDefinitionProvider'),
     }), vscode.languages.registerTypeDefinitionProvider(selector, {
-        provideTypeDefinition: forward('vscode.executeTypeDefinitionProvider'),
+        provideTypeDefinition: locations('vscode.executeTypeDefinitionProvider'),
     }), vscode.languages.registerImplementationProvider(selector, {
-        provideImplementation: forward('vscode.executeImplementationProvider'),
+        provideImplementation: locations('vscode.executeImplementationProvider'),
     }), vscode.languages.registerReferenceProvider(selector, {
-        provideReferences: forward('vscode.executeReferenceProvider'),
+        async provideReferences(document, position) {
+            const realUri = await ensureRealUri(document.uri);
+            if (!realUri) {
+                return undefined;
+            }
+            return vscode.commands.executeCommand('vscode.executeReferenceProvider', realUri, position);
+        },
     }), vscode.languages.registerHoverProvider(selector, {
-        provideHover: forward('vscode.executeHoverProvider'),
+        async provideHover(document, position) {
+            const realUri = await ensureRealUri(document.uri);
+            if (!realUri) {
+                return undefined;
+            }
+            const hovers = await vscode.commands.executeCommand('vscode.executeHoverProvider', realUri, position);
+            return hovers?.[0];
+        },
     }));
 }
 //# sourceMappingURL=virtualDocLanguageFeatures.js.map

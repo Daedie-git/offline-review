@@ -49,162 +49,304 @@ const localReviewTool_1 = require("./tools/localReviewTool");
 const fileDecorationProvider_1 = require("./decorations/fileDecorationProvider");
 const suggestChangePanel_1 = require("./views/suggestChangePanel");
 const virtualDocLanguageFeatures_1 = require("./language/virtualDocLanguageFeatures");
+const types_1 = require("./types");
 async function activate(context) {
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!workspaceRoot) {
         vscode.window.showInformationMessage('Offline Review: Open a Git repository folder to use this extension.');
         return;
     }
-    // Initialize git service
     const gitService = new gitService_1.GitService(context);
-    // Initialize services (will work once git is ready)
     const localPrManager = new localPrManager_1.LocalPrManager(gitService, workspaceRoot);
     const storageService = new storageService_1.StorageService(localPrManager);
-    // Register custom URI scheme for git file content
     const gitFileContentProvider = new gitFileContentProvider_1.GitFileContentProvider(gitService);
     context.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider('git-local-review', gitFileContentProvider));
-    // Bridge Go to Definition / Hover / etc. from virtual diffs onto real files
     (0, virtualDocLanguageFeatures_1.registerVirtualDocLanguageFeatures)(context);
-    // Initialize view providers
     const branchSelectorProvider = new branchSelectorWebviewProvider_1.BranchSelectorWebviewProvider(context.extensionUri, gitService, localPrManager);
     const changedFilesProvider = new changedFilesProvider_1.ChangedFilesProvider(gitService, storageService, localPrManager);
     const localPrsProvider = new localPrsProvider_1.LocalPrsProvider(localPrManager);
     const localCommentsProvider = new localCommentsProvider_1.LocalCommentsProvider(storageService);
-    // Initialize comment controller
     const commentController = new commentController_1.ReviewCommentController(storageService);
-    // Initialize file decoration provider (shows unresolved comment badges in explorer)
     const fileDecorationProvider = new fileDecorationProvider_1.ReviewFileDecorationProvider(storageService);
     context.subscriptions.push(vscode.window.registerFileDecorationProvider(fileDecorationProvider));
-    // Register Copilot Language Model Tool (optional — requires VS Code 1.93+ and Copilot)
     try {
         const localReviewTool = new localReviewTool_1.LocalReviewTool(gitService, localPrManager, storageService);
         context.subscriptions.push(vscode.lm.registerTool('localPrReview_getComments', localReviewTool));
     }
     catch {
-        // Language Model API unavailable — extension works without it
+        // The Language Model API is optional.
     }
-    // Register views
     context.subscriptions.push(vscode.window.registerWebviewViewProvider(branchSelectorWebviewProvider_1.BranchSelectorWebviewProvider.viewType, branchSelectorProvider));
-    // Changed files tree view with checkbox support
     const changedFilesTreeView = vscode.window.createTreeView('localPrReview.changedFiles', {
         treeDataProvider: changedFilesProvider,
         manageCheckboxStateManually: true,
         showCollapseAll: true,
     });
-    changedFilesTreeView.onDidChangeCheckboxState(e => {
-        for (const [item, state] of e.items) {
+    context.subscriptions.push(changedFilesTreeView.onDidChangeCheckboxState(event => {
+        for (const [item, state] of event.items) {
             if (item instanceof changedFilesProvider_1.FileChangeItem) {
                 changedFilesProvider.setFileReviewed(item.fileChange.filePath, state === vscode.TreeItemCheckboxState.Checked);
             }
         }
-    });
-    context.subscriptions.push(changedFilesTreeView, vscode.window.createTreeView('localPrReview.localPrs', {
+    }), changedFilesTreeView, vscode.window.createTreeView('localPrReview.localPrs', {
         treeDataProvider: localPrsProvider,
     }), vscode.window.createTreeView('localPrReview.localComments', {
         treeDataProvider: localCommentsProvider,
     }));
-    // Initialize git asynchronously (after tree views are registered)
     const initialized = await gitService.initialize();
     if (!initialized) {
-        vscode.window.showInformationMessage('Offline Review: No git repository found. Open a folder with a git repo.');
+        vscode.window.showInformationMessage('Offline Review: No Git repository found. Open a folder with a Git repository.');
     }
-    // Sync the list of reviewable file paths so comments work on working-tree files
-    const syncReviewableFiles = () => {
-        commentController.setReviewableFiles(changedFilesProvider.getAllFilePaths());
-    };
-    // Load active review on startup
-    if (initialized) {
-        const activeReview = localPrManager.getActiveReview();
-        if (activeReview) {
-            await changedFilesProvider.refresh(activeReview.sourceBranch, activeReview.targetBranch);
-            syncReviewableFiles();
-            await commentController.loadAllThreads(gitService, activeReview.sourceBranch, activeReview.targetBranch);
+    // Every review switch/refresh runs through this generation. Preparation does
+    // not mutate visible state; one synchronous apply publishes only the winner.
+    let transitionGeneration = 0;
+    const transitionToReview = async (review, options = {}, reservedGeneration) => {
+        const generation = reservedGeneration ?? ++transitionGeneration;
+        if (generation !== transitionGeneration) {
+            return false;
         }
-    }
-    // Helper: auto-create review and refresh files when both branches are selected
-    const autoRefreshFiles = async (base, compare, mode, options = {}) => {
-        if (!(base && compare)) {
-            return;
-        }
-        const resolvedMode = mode || (base === compare ? 'uncommitted' : 'branch');
         try {
-            await localPrManager.createReview(base, compare, resolvedMode);
-            storageService.ensureCommentsFile();
-            await changedFilesProvider.refresh(base, compare);
-            syncReviewableFiles();
-            localCommentsProvider.refresh();
-            await commentController.loadAllThreads(gitService, base, compare);
-            fileDecorationProvider.refresh();
-            const currentBranch = await gitService.getCurrentBranch();
-            branchSelectorProvider.setReviewState({
-                base: resolvedMode === 'uncommitted' ? localPrManager.getPreferredBaseBranch() : base,
-                compare,
-                mode: resolvedMode,
-                currentBranch: currentBranch || '',
-            });
-            if (!options.quiet) {
-                const n = changedFilesProvider.getAllFilePaths().length;
-                if (resolvedMode === 'uncommitted') {
-                    vscode.window.showInformationMessage(`Uncommitted review: ${n} file${n === 1 ? '' : 's'}`);
-                }
-                else {
-                    vscode.window.showInformationMessage(`Branch review: ${compare} vs ${base} (${n} file${n === 1 ? '' : 's'})`);
-                }
+            const [prepared, currentBranch] = await Promise.all([
+                changedFilesProvider.prepareRefresh(review),
+                gitService.getCurrentBranch(),
+            ]);
+            if (generation !== transitionGeneration) {
+                return false;
             }
+            if (options.ensureCommentsFile !== false) {
+                storageService.ensureCommentsFileForReview(review.id);
+            }
+            localPrManager.setActiveReview(review.id);
+            changedFilesProvider.applyPreparedState(prepared);
+            if (prepared.plan.kind === 'branch') {
+                localPrManager.updateBranchReviewFallbackCommits(prepared.plan.reviewId, prepared.plan.baseCommit, prepared.plan.targetCommit);
+            }
+            commentController.setReviewableFiles(prepared.files.map(file => file.filePath));
+            commentController.loadAllThreads(prepared.plan);
+            branchSelectorProvider.setReviewState({
+                review,
+                currentBranch: currentBranch ?? '',
+            });
+            localPrsProvider.refresh();
+            localCommentsProvider.refresh();
+            fileDecorationProvider.refresh();
+            return true;
         }
-        catch (err) {
-            vscode.window.showErrorMessage(`Offline Review refresh failed: ${err?.message ?? err}`);
+        catch (error) {
+            if (generation === transitionGeneration && options.showError !== false) {
+                vscode.window.showErrorMessage(`Offline Review refresh failed: ${errorMessage(error)}`);
+            }
+            return false;
         }
     };
-    const reviewUncommitted = async () => {
+    const clearReviewUi = async () => {
+        const generation = ++transitionGeneration;
+        changedFilesProvider.clear();
+        commentController.setReviewableFiles([]);
+        commentController.loadAllThreads();
+        localPrsProvider.refresh();
+        localCommentsProvider.refresh();
+        fileDecorationProvider.refresh();
+        const currentBranch = await gitService.getCurrentBranch();
+        if (generation === transitionGeneration) {
+            branchSelectorProvider.setReviewState({
+                currentBranch: currentBranch ?? '',
+                mode: localPrManager.getActiveMode(),
+            });
+        }
+    };
+    const getOrCreateUncommittedReview = async (branch) => {
+        const existing = localPrManager.findReviewByBranch(branch, 'uncommitted');
+        return existing ?? localPrManager.createUncommittedReview(branch, false);
+    };
+    const getOrCreateBranchReview = async (baseBranch, targetBranch) => {
+        const existing = localPrManager.listReviews().find(review => review.mode === 'branch'
+            && review.baseBranch === baseBranch
+            && review.targetBranch === targetBranch);
+        return existing
+            ?? localPrManager.createBranchReview(baseBranch, targetBranch, false);
+    };
+    const reviewUncommitted = async (options = {}) => {
+        const generation = ++transitionGeneration;
         const branch = await gitService.getCurrentBranch();
-        if (!branch) {
-            vscode.window.showWarningMessage('Offline Review: no current git branch (detached HEAD?)');
-            return;
+        if (generation !== transitionGeneration) {
+            return false;
         }
-        await autoRefreshFiles(branch, branch, 'uncommitted');
+        if (!branch) {
+            if (!options.quiet) {
+                vscode.window.showWarningMessage('Offline Review: no current Git branch (detached HEAD?).');
+            }
+            return false;
+        }
+        try {
+            const review = await getOrCreateUncommittedReview(branch);
+            const applied = await transitionToReview(review, { showError: !options.quiet }, generation);
+            if (applied && !options.quiet) {
+                const count = changedFilesProvider.getAllFilePaths().length;
+                vscode.window.showInformationMessage(`Uncommitted review on ${branch}: ${count} file${count === 1 ? '' : 's'}`);
+            }
+            return applied;
+        }
+        catch (error) {
+            if (!options.quiet) {
+                vscode.window.showErrorMessage(`Could not open uncommitted review: ${errorMessage(error)}`);
+            }
+            return false;
+        }
     };
-    const resolveBaseBranch = async (compareBranch) => {
+    const resolveBaseBranch = async (compareBranch, generation) => {
         const branches = await gitService.getBranches(true);
-        const selected = branchSelectorProvider.getSourceBranch() || localPrManager.getPreferredBaseBranch();
-        const base = selected && selected !== compareBranch && branches.includes(selected)
-            ? selected
-            : await gitService.getPrimaryBranch(branches, compareBranch);
-        if (!base) {
+        if (generation !== undefined && generation !== transitionGeneration) {
             return undefined;
         }
-        localPrManager.setPreferredBaseBranch(base);
-        branchSelectorProvider.setSourceBranch(base);
+        const selected = branchSelectorProvider.getSourceBranch()
+            || localPrManager.getPreferredBaseBranch();
+        let base = selected && branches.includes(selected) ? selected : undefined;
+        if (!base) {
+            base = await gitService.getPrimaryBranch(branches, undefined, {
+                allowUnavailable: false,
+                localFallback: false,
+            });
+        }
+        if (!base) {
+            base = await gitService.getSoleLocalBranch(compareBranch);
+        }
+        if (!base) {
+            const localBranches = await gitService.getBranches(false);
+            if (localBranches.length === 1 && localBranches[0] === compareBranch) {
+                base = compareBranch;
+            }
+        }
+        if (generation !== undefined && generation !== transitionGeneration) {
+            return undefined;
+        }
+        if (base) {
+            localPrManager.setPreferredBaseBranch(base);
+        }
         return base;
     };
-    const reviewActiveBranch = async () => {
+    const reviewActiveBranch = async (options = {}) => {
+        const generation = ++transitionGeneration;
         const branch = await gitService.getCurrentBranch();
+        if (generation !== transitionGeneration) {
+            return false;
+        }
         if (!branch) {
-            vscode.window.showWarningMessage('Offline Review: no current git branch (detached HEAD?)');
-            return;
+            if (!options.quiet) {
+                vscode.window.showWarningMessage('Offline Review: no current Git branch (detached HEAD?).');
+            }
+            return false;
         }
-        const base = await resolveBaseBranch(branch);
-        if (!base) {
-            vscode.window.showWarningMessage('Offline Review: no base branch found. Create or fetch another branch, or select a base branch first.');
-            return;
+        try {
+            const base = await resolveBaseBranch(branch, generation);
+            if (generation !== transitionGeneration) {
+                return false;
+            }
+            if (!base) {
+                if (!options.quiet) {
+                    vscode.window.showWarningMessage('Offline Review: no primary/base branch found. Fetch remote metadata or select a base branch.');
+                }
+                return false;
+            }
+            const review = await getOrCreateBranchReview(base, branch);
+            const applied = await transitionToReview(review, { showError: !options.quiet }, generation);
+            if (applied && !options.quiet) {
+                const count = changedFilesProvider.getAllFilePaths().length;
+                const suffix = base === branch
+                    ? ' (intentional primary-branch self-review)'
+                    : '';
+                vscode.window.showInformationMessage(`Branch review: ${(0, types_1.formatReviewLabel)(review)} — ${count} file${count === 1 ? '' : 's'}${suffix}`);
+            }
+            return applied;
         }
-        await autoRefreshFiles(base, branch, 'branch');
+        catch (error) {
+            if (!options.quiet) {
+                vscode.window.showErrorMessage(`Could not open branch review: ${errorMessage(error)}`);
+            }
+            return false;
+        }
     };
-    // Auto-refresh changed files + WORKTREE virtual docs on save
-    let refreshTimer;
-    context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(async (doc) => {
+    const activateReviewFromUi = async (review) => {
+        const generation = ++transitionGeneration;
+        if (review.mode !== 'uncommitted') {
+            await transitionToReview(review, {}, generation);
+            return;
+        }
+        const currentBranch = await gitService.getCurrentBranch();
+        if (generation !== transitionGeneration) {
+            return;
+        }
+        if (currentBranch === review.branch) {
+            await transitionToReview(review, {}, generation);
+            return;
+        }
+        const openCurrent = currentBranch
+            ? `Open ${currentBranch} (Recommended)`
+            : undefined;
+        const switchSaved = `Switch to ${review.branch}`;
+        const choices = openCurrent
+            ? [openCurrent, switchSaved, 'Cancel']
+            : [switchSaved, 'Cancel'];
+        const answer = await vscode.window.showWarningMessage(`This uncommitted review belongs to "${review.branch}", but `
+            + `${currentBranch ? `"${currentBranch}" is checked out` : 'HEAD is detached'}.`, { modal: true }, ...choices);
+        if (generation !== transitionGeneration) {
+            return;
+        }
+        if (answer === openCurrent && currentBranch) {
+            await reviewUncommitted();
+        }
+        else if (answer === switchSaved) {
+            try {
+                await gitService.checkoutBranch(review.branch);
+                await transitionToReview(review);
+            }
+            catch (error) {
+                vscode.window.showErrorMessage(`Could not switch to ${review.branch}: ${errorMessage(error)}`);
+            }
+        }
+    };
+    const restoreModeAfterClear = async (mode, previous) => {
+        if (mode === 'uncommitted') {
+            if (!await reviewUncommitted({ quiet: true })) {
+                await clearReviewUi();
+            }
+            return;
+        }
+        if (previous?.mode === 'branch') {
+            const generation = ++transitionGeneration;
+            try {
+                const review = await getOrCreateBranchReview(previous.baseBranch, previous.targetBranch);
+                if (await transitionToReview(review, { showError: false }, generation)) {
+                    return;
+                }
+            }
+            catch {
+                // Fall back to a review of the currently checked-out branch.
+            }
+        }
+        if (!await reviewActiveBranch({ quiet: true })) {
+            await clearReviewUi();
+        }
+    };
+    if (initialized) {
         const active = localPrManager.getActiveReview();
-        if (!active) {
+        if (localPrManager.getActiveMode() === 'uncommitted') {
+            // Checkout identity wins on startup; never auto-checkout a saved branch.
+            await reviewUncommitted({ quiet: true });
+        }
+        else if (active?.mode === 'branch') {
+            await transitionToReview(active);
+        }
+    }
+    let refreshTimer;
+    context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(document => {
+        const plan = changedFilesProvider.getDiffPlan();
+        const active = localPrManager.getActiveReview();
+        if (!active || !plan || plan.kind !== 'worktree' || plan.reviewId !== active.id) {
             return;
         }
-        const isWorkingTree = active.sourceBranch === active.targetBranch
-            || await gitService.isCurrentBranch(active.targetBranch);
-        if (!isWorkingTree) {
-            return;
-        }
-        if (doc.uri.scheme === 'file') {
-            const rel = vscode.workspace.asRelativePath(doc.uri, false);
-            gitFileContentProvider.refreshWorkingTreeFile(rel);
+        if (document.uri.scheme === 'file') {
+            gitFileContentProvider.refreshWorkingTreeFile(vscode.workspace.asRelativePath(document.uri, false));
         }
         else {
             gitFileContentProvider.refreshAllWorkingTree();
@@ -212,470 +354,391 @@ async function activate(context) {
         if (refreshTimer) {
             clearTimeout(refreshTimer);
         }
-        refreshTimer = setTimeout(async () => {
-            await changedFilesProvider.refresh(active.sourceBranch, active.targetBranch);
-            syncReviewableFiles();
+        const reviewId = active.id;
+        refreshTimer = setTimeout(() => {
+            const current = localPrManager.getActiveReview();
+            const appliedPlan = changedFilesProvider.getDiffPlan();
+            if (current?.id === reviewId
+                && appliedPlan?.kind === 'worktree'
+                && appliedPlan.reviewId === reviewId) {
+                void transitionToReview(current);
+            }
         }, 500);
-    }));
-    // Mode buttons drive refresh; legacy base/compare fires are ignored.
-    context.subscriptions.push(branchSelectorProvider.onDidSelectBranches(async () => { }));
-    // When the git branch changes, refresh the active mode against the new tip.
-    context.subscriptions.push(gitService.onDidChangeBranch(async (newBranch) => {
-        const mode = localPrManager.getActiveMode();
-        if (mode === 'uncommitted') {
-            await autoRefreshFiles(newBranch, newBranch, 'uncommitted');
+    }), { dispose: () => refreshTimer && clearTimeout(refreshTimer) });
+    context.subscriptions.push(branchSelectorProvider.onDidSelectBranches(() => {
+        // Selecting a base only updates preference. Mode buttons apply it.
+    }), gitService.onDidChangeCheckout(({ branch }) => {
+        // Open worktree documents may survive checkouts; invalidate each
+        // actual cached identity before preparing the next branch state.
+        gitFileContentProvider.refreshAllWorkingTree();
+        if (!branch) {
+            // Reserve immediately so any in-flight transition for the former
+            // branch cannot publish after the checkout becomes detached.
+            transitionGeneration++;
+            if (localPrManager.getActiveMode() === 'uncommitted') {
+                void clearReviewUi();
+                void vscode.window.showWarningMessage('Offline Review: uncommitted reviews are unavailable while HEAD is detached. '
+                    + 'Check out a branch to continue.');
+            }
             return;
         }
-        const base = newBranch ? await resolveBaseBranch(newBranch) : undefined;
-        if (base && newBranch) {
-            await autoRefreshFiles(base, newBranch, 'branch');
-        }
-    }));
-    // Auto-refresh when new commits are made on the current branch
-    context.subscriptions.push(gitService.onDidChangeHead(async () => {
-        const active = localPrManager.getActiveReview();
-        if (!active) {
-            return;
-        }
-        await changedFilesProvider.refresh(active.sourceBranch, active.targetBranch);
-        syncReviewableFiles();
-        fileDecorationProvider.refresh();
-    }));
-    // Reload UI when an external process edits comments.json (agents, scripts).
-    const reloadCommentsFromDisk = async () => {
-        localCommentsProvider.refresh();
-        const active = localPrManager.getActiveReview();
-        if (active) {
-            await commentController.loadAllThreads(gitService, active.sourceBranch, active.targetBranch);
+        if (localPrManager.getActiveMode() === 'uncommitted') {
+            // This path reserves its generation before the first Git await,
+            // so rapid B -> C checkouts cannot let B cancel C.
+            void reviewUncommitted({ quiet: true });
         }
         else {
-            await commentController.loadAllThreads();
+            void reviewActiveBranch({ quiet: true });
         }
-        fileDecorationProvider.refresh();
-        changedFilesProvider.fireChange();
-    };
-    let commentsWatchTimer;
-    const onCommentsFileChanged = (uri) => {
-        const fsPath = uri?.fsPath;
-        if (storageService.shouldIgnoreWatch(fsPath)) {
-            // Own write (hash match) — ignore. Time-only suppress — retry after window
-            // so an interleaved agent edit is not dropped forever.
-            if (storageService._lastWrittenHash && fsPath && fs.existsSync(fsPath)) {
-                try {
-                    const hash = require('crypto').createHash('sha1').update(require('fs').readFileSync(fsPath)).digest('hex');
-                    if (hash === storageService._lastWrittenHash) {
-                        return;
-                    }
-                }
-                catch { /* retry below */ }
+    }), gitService.onDidChangeHead(() => {
+        void (async () => {
+            const active = localPrManager.getActiveReview();
+            if (!active) {
+                return;
             }
-            const wait = (storageService.msUntilWatchAllowed?.() ?? 300) + 50;
+            if (active.mode === 'uncommitted' && !await gitService.getCurrentBranch()) {
+                await clearReviewUi();
+                return;
+            }
+            await transitionToReview(active);
+        })();
+    }));
+    let commentsWatchTimer;
+    const reloadCommentsFromDisk = () => {
+        const active = localPrManager.getActiveReview();
+        if (active) {
+            void transitionToReview(active, {
+                ensureCommentsFile: false,
+                showError: false,
+            });
+        }
+        else {
+            localCommentsProvider.refresh();
+        }
+    };
+    const onCommentsFileChanged = (uri) => {
+        const schedule = (delay) => {
             if (commentsWatchTimer) {
                 clearTimeout(commentsWatchTimer);
             }
             commentsWatchTimer = setTimeout(() => {
-                if (!storageService.shouldIgnoreWatch(fsPath)) {
-                    void reloadCommentsFromDisk();
+                if (!storageService.shouldIgnoreWatch(uri.fsPath)) {
+                    reloadCommentsFromDisk();
                 }
-            }, wait);
-            return;
+            }, delay);
+        };
+        if (storageService.shouldIgnoreWatch(uri.fsPath)) {
+            schedule(storageService.msUntilWatchAllowed() + 50);
         }
-        if (commentsWatchTimer) {
-            clearTimeout(commentsWatchTimer);
+        else {
+            schedule(400);
         }
-        commentsWatchTimer = setTimeout(() => {
-            if (storageService.shouldIgnoreWatch(fsPath)) {
-                return;
-            }
-            void reloadCommentsFromDisk();
-        }, 400);
     };
-    const commentsWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(workspaceRoot, '.vscode/offline-review/**/comments.json'));
-    context.subscriptions.push(commentsWatcher, commentsWatcher.onDidChange(onCommentsFileChanged), commentsWatcher.onDidCreate(onCommentsFileChanged), commentsWatcher.onDidDelete(onCommentsFileChanged));
-    // --- Register commands ---
-    // Create review
+    const watcherPatterns = [
+        '.vscode/local-reviews/reviews/*/comments.json',
+    ];
+    for (const pattern of watcherPatterns) {
+        const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(workspaceRoot, pattern));
+        context.subscriptions.push(watcher, watcher.onDidChange(onCommentsFileChanged), watcher.onDidCreate(onCommentsFileChanged), watcher.onDidDelete(onCommentsFileChanged));
+    }
+    context.subscriptions.push({
+        dispose: () => commentsWatchTimer && clearTimeout(commentsWatchTimer),
+    });
     context.subscriptions.push(vscode.commands.registerCommand('localPrReview.createReview', async () => {
-        const source = branchSelectorProvider.getSourceBranch();
-        const target = branchSelectorProvider.getTargetBranch();
-        if (!source) {
-            vscode.window.showWarningMessage('Please select a base branch first');
-            return;
+        if (branchSelectorProvider.getMode() === 'uncommitted') {
+            await reviewUncommitted();
         }
-        if (!target) {
-            vscode.window.showWarningMessage('Please select a compare branch first');
-            return;
+        else {
+            await reviewActiveBranch();
         }
-        await autoRefreshFiles(source, target);
-        const label = source === target
-            ? `uncommitted on ${source}`
-            : `${target} -> ${source}`;
-        vscode.window.showInformationMessage(`Review created: ${label}`);
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.reviewUncommitted', async () => {
+    }), vscode.commands.registerCommand('localPrReview.reviewUncommitted', async () => {
         await reviewUncommitted();
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.reviewActiveBranch', async () => {
+    }), vscode.commands.registerCommand('localPrReview.reviewActiveBranch', async () => {
         await reviewActiveBranch();
+    }), vscode.commands.registerCommand('localPrReview.activateReview', async (item) => {
+        const reviewId = item instanceof localPrsProvider_1.LocalPrItem
+            ? item.review.id
+            : typeof item === 'string'
+                ? item
+                : item?.id;
+        const review = reviewId
+            ? localPrManager.getReviewById(reviewId)
+            : undefined;
+        if (review) {
+            await activateReviewFromUi(review);
+        }
     }));
-    // Activate review (click on Local PR)
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.activateReview', async (item) => {
-        localPrManager.setActiveReview(item.review.id);
-        const mode = item.review.sourceBranch === item.review.targetBranch ? 'uncommitted' : 'branch';
-        localPrManager.setActiveMode(mode);
-        if (mode === 'branch') {
-            localPrManager.setPreferredBaseBranch(item.review.sourceBranch);
-        }
-        branchSelectorProvider.refresh();
-        await changedFilesProvider.refresh(item.review.sourceBranch, item.review.targetBranch);
-        syncReviewableFiles();
-        localCommentsProvider.refresh();
-        await commentController.loadAllThreads(gitService, item.review.sourceBranch, item.review.targetBranch);
-    }));
-    // Delete review (from Local PRs tree or command palette)
-    const restoreModeAfterClear = async (mode, sourceBranch, targetBranch) => {
-        localCommentsProvider.refresh();
-        localPrsProvider.refresh();
-        fileDecorationProvider.refresh();
-        // Keep Changed Files populated: recreate an empty review in the same mode.
-        if (mode === 'uncommitted') {
-            const branch = targetBranch || await gitService.getCurrentBranch();
-            if (branch) {
-                await autoRefreshFiles(branch, branch, 'uncommitted', { quiet: true });
-            }
-            return;
-        }
-        const compare = targetBranch || await gitService.getCurrentBranch();
-        if (sourceBranch && sourceBranch !== compare) {
-            branchSelectorProvider.setSourceBranch(sourceBranch);
-        }
-        const base = compare ? await resolveBaseBranch(compare) : undefined;
-        if (base && compare) {
-            await autoRefreshFiles(base, compare, 'branch', { quiet: true });
-            return;
-        }
-        await reviewActiveBranch();
-    };
-    const clearUiAfterDelete = async () => {
-        changedFilesProvider.clear();
-        commentController.setReviewableFiles([]);
-        await commentController.loadAllThreads();
-        localCommentsProvider.refresh();
-        localPrsProvider.refresh();
-        branchSelectorProvider.refresh();
-        fileDecorationProvider.refresh();
-    };
     context.subscriptions.push(vscode.commands.registerCommand('localPrReview.deleteReview', async (item) => {
-        const review = item?.review || localPrManager.getActiveReview();
+        const reviewId = typeof item === 'string' ? item : item?.review.id;
+        const review = reviewId
+            ? localPrManager.getReviewById(reviewId)
+            : localPrManager.getActiveReview();
         if (!review) {
             vscode.window.showInformationMessage('No review to delete.');
             return;
         }
-        const label = review.sourceBranch === review.targetBranch
-            ? `uncommitted on ${review.targetBranch}`
-            : `${review.targetBranch} vs ${review.sourceBranch}`;
-        const answer = await vscode.window.showWarningMessage(`Delete review "${label}"? This also deletes its comments.`, { modal: true }, 'Delete');
-        if (answer === 'Delete') {
-            const wasActive = localPrManager.getActiveReview()?.id === review.id;
-            const mode = review.sourceBranch === review.targetBranch ? 'uncommitted' : 'branch';
-            const { sourceBranch, targetBranch } = review;
-            localPrManager.deleteReview(review.id);
-            if (wasActive) {
-                await restoreModeAfterClear(mode, sourceBranch, targetBranch);
-            }
-            else {
-                // Non-active delete must not wipe the still-active review's file list.
-                localPrsProvider.refresh();
-                localCommentsProvider.refresh();
-                fileDecorationProvider.refresh();
-            }
+        const answer = await vscode.window.showWarningMessage(`Delete review "${(0, types_1.formatReviewLabel)(review)}"? This also deletes its comments.`, { modal: true }, 'Delete');
+        if (answer !== 'Delete') {
+            return;
         }
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.clearActiveReview', async () => {
+        const wasActive = localPrManager.getActiveReview()?.id === review.id;
+        transitionGeneration++;
+        await storageService.withWatchSuppressed(() => {
+            localPrManager.deleteReview(review.id);
+        });
+        if (wasActive) {
+            await restoreModeAfterClear(review.mode, review);
+        }
+        else {
+            localPrsProvider.refresh();
+            localCommentsProvider.refresh();
+            fileDecorationProvider.refresh();
+        }
+    }), vscode.commands.registerCommand('localPrReview.clearActiveReview', async () => {
         const active = localPrManager.getActiveReview();
         if (!active) {
             vscode.window.showInformationMessage('No active review to clear.');
             return;
         }
-        const label = active.sourceBranch === active.targetBranch
-            ? `uncommitted on ${active.targetBranch}`
-            : `${active.targetBranch} vs ${active.sourceBranch}`;
-        const answer = await vscode.window.showWarningMessage(`Clear active review (${label}) and its comments?`, { modal: true }, 'Clear');
+        const answer = await vscode.window.showWarningMessage(`Clear active review "${(0, types_1.formatReviewLabel)(active)}" and its comments?`, { modal: true }, 'Clear');
         if (answer !== 'Clear') {
             return;
         }
-        const mode = active.sourceBranch === active.targetBranch ? 'uncommitted' : 'branch';
-        const { sourceBranch, targetBranch } = active;
-        localPrManager.clearActiveReview();
-        await storageService.withWatchSuppressed(async () => {
-            await restoreModeAfterClear(mode, sourceBranch, targetBranch);
+        if (localPrManager.getActiveReview()?.id !== active.id) {
+            vscode.window.showInformationMessage('The active review changed; nothing was cleared.');
+            return;
+        }
+        transitionGeneration++;
+        await storageService.withWatchSuppressed(() => {
+            localPrManager.deleteReview(active.id);
         });
-        vscode.window.showInformationMessage('Comments cleared.');
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.clearAllReviews', async () => {
-        const n = localPrManager.listReviews().length;
-        if (n === 0) {
+        await restoreModeAfterClear(active.mode, active);
+        vscode.window.showInformationMessage('Active review comments cleared.');
+    }), vscode.commands.registerCommand('localPrReview.clearAllReviews', async () => {
+        const count = localPrManager.listReviews().length;
+        if (count === 0) {
             vscode.window.showInformationMessage('No reviews to clear.');
             return;
         }
         const active = localPrManager.getActiveReview();
-        const mode = active
-            ? (active.sourceBranch === active.targetBranch ? 'uncommitted' : 'branch')
-            : localPrManager.getActiveMode();
-        const sourceBranch = active?.sourceBranch;
-        const targetBranch = active?.targetBranch;
-        const answer = await vscode.window.showWarningMessage(`Clear all ${n} offline review${n === 1 ? '' : 's'} and their comments?`, { modal: true }, 'Clear all');
+        const mode = active?.mode ?? localPrManager.getActiveMode();
+        const answer = await vscode.window.showWarningMessage(`Clear all ${count} offline review${count === 1 ? '' : 's'} and their comments?`, { modal: true }, 'Clear all');
         if (answer !== 'Clear all') {
             return;
         }
-        localPrManager.clearAllReviews();
-        await storageService.withWatchSuppressed(async () => {
-            await restoreModeAfterClear(mode, sourceBranch, targetBranch);
+        transitionGeneration++;
+        await storageService.withWatchSuppressed(() => {
+            localPrManager.clearAllReviews();
         });
-        vscode.window.showInformationMessage('All comments cleared.');
+        await restoreModeAfterClear(mode, active);
+        vscode.window.showInformationMessage('All review comments cleared.');
     }));
-    // Refresh changed files
     context.subscriptions.push(vscode.commands.registerCommand('localPrReview.refreshFiles', async () => {
         const active = localPrManager.getActiveReview();
         if (active) {
-            await changedFilesProvider.refresh(active.sourceBranch, active.targetBranch);
-            syncReviewableFiles();
+            if (changedFilesProvider.getDiffPlan()?.kind === 'worktree') {
+                gitFileContentProvider.refreshAllWorkingTree();
+            }
+            await transitionToReview(active);
         }
-    }));
-    // Expand all in changed files tree
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.expandAll', async () => {
-        const items = changedFilesProvider.getAllExpandableItems();
-        for (const item of items) {
+    }), vscode.commands.registerCommand('localPrReview.expandAll', async () => {
+        for (const item of changedFilesProvider.getAllExpandableItems()) {
             try {
-                await changedFilesTreeView.reveal(item, { expand: true, select: false, focus: false });
+                await changedFilesTreeView.reveal(item, {
+                    expand: true,
+                    select: false,
+                    focus: false,
+                });
             }
             catch {
-                // item may not be visible
+                // Tree contents may have changed while expanding.
             }
         }
-    }));
-    // Open file (working copy)
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.openFile', async (item) => {
-        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
-        if (workspaceRoot) {
-            const fileUri = vscode.Uri.joinPath(workspaceRoot, item.fileChange.filePath);
-            await vscode.window.showTextDocument(fileUri);
+    }), vscode.commands.registerCommand('localPrReview.openFile', async (item) => {
+        const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+        if (root) {
+            await vscode.window.showTextDocument(vscode.Uri.joinPath(root, item.fileChange.filePath));
+        }
+    }), vscode.commands.registerCommand('localPrReview.openDiff', async (item) => {
+        const review = localPrManager.getReviewById(item.diffPlan.reviewId);
+        const title = review
+            ? `${item.fileChange.filePath} (${(0, types_1.formatReviewLabel)(review)})`
+            : item.fileChange.filePath;
+        await vscode.commands.executeCommand('vscode.diff', item.leftUri, item.rightUri, title);
+        commentController.loadThreadsForFile(item.rightUri, item.fileChange.filePath, item.diffPlan);
+    }), vscode.commands.registerCommand('localPrReview.openAllDiffs', async () => {
+        const files = changedFilesProvider.getAllFileItems();
+        if (files.length === 0) {
+            vscode.window.showInformationMessage('No changed files to show.');
+            return;
+        }
+        const plan = changedFilesProvider.getDiffPlan();
+        const review = plan ? localPrManager.getReviewById(plan.reviewId) : undefined;
+        const resources = files.map(item => [
+            item.leftUri,
+            item.rightUri,
+            undefined,
+        ]);
+        try {
+            await vscode.commands.executeCommand('vscode.changes', `Review: ${review ? (0, types_1.formatReviewLabel)(review) : 'changed files'}`, resources);
+        }
+        catch (error) {
+            vscode.window.showErrorMessage(`Multi-diff editor failed: ${errorMessage(error)}`);
         }
     }));
-    // Open diff
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.openDiff', async (item) => {
-        const leftUri = gitService.getFileUri(item.sourceBranch, item.fileChange.filePath);
-        const isWorkingTree = item.sourceBranch === item.targetBranch
-            || await gitService.isCurrentBranch(item.targetBranch);
-        const rightUri = isWorkingTree
-            ? gitService.getWorkingTreeFileUri(item.fileChange.filePath)
-            : gitService.getFileUri(item.targetBranch, item.fileChange.filePath, 'modified');
-        const title = `${item.fileChange.filePath} (${item.sourceBranch} <-> ${item.targetBranch})`;
-        await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title);
-        commentController.loadThreadsForFile(rightUri, item.fileChange.filePath);
-    }));
-    // Comment commands
+    const refreshCommentUi = () => {
+        localCommentsProvider.refresh();
+        fileDecorationProvider.refresh();
+        changedFilesProvider.fireChange();
+    };
     context.subscriptions.push(vscode.commands.registerCommand('localPrReview.addComment', (reply) => {
         try {
-            const thread = reply.thread;
-            if (!thread) {
-                throw new Error('Missing comment thread');
-            }
-            const filePath = extractFilePath(thread.uri);
-            if (!filePath) {
-                throw new Error('Could not resolve file path for comment');
-            }
-            const range = thread.range ?? new vscode.Range(0, 0, 0, 0);
-            if (thread.comments.length === 0) {
-                commentController.createThread(thread.uri, range, reply.text ?? '', filePath, thread);
-            }
-            else {
-                commentController.addReply(thread, reply.text ?? '');
-            }
-            localCommentsProvider.refresh();
-            fileDecorationProvider.refresh();
-            changedFilesProvider.fireChange();
+            addOrReply(commentController, reply);
+            refreshCommentUi();
         }
-        catch (err) {
-            vscode.window.showErrorMessage(`Failed to add comment: ${err.message}`);
+        catch (error) {
+            vscode.window.showErrorMessage(`Failed to add comment: ${errorMessage(error)}`);
         }
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.saveComment', (reply) => {
+    }), vscode.commands.registerCommand('localPrReview.saveComment', (reply) => {
         try {
-            const thread = reply.thread;
-            if (!thread) {
-                throw new Error('Missing comment thread');
-            }
-            const filePath = extractFilePath(thread.uri);
-            if (!filePath) {
-                throw new Error('Could not resolve file path for comment');
-            }
-            const range = thread.range ?? new vscode.Range(0, 0, 0, 0);
-            const editing = thread.comments.find(c => c.mode === vscode.CommentMode.Editing);
+            const editing = reply.thread.comments.find(comment => comment.mode === vscode.CommentMode.Editing);
             if (editing) {
-                commentController.saveEditedComment(thread, editing, reply.text ?? '');
-            }
-            else if (thread.comments.length === 0) {
-                commentController.createThread(thread.uri, range, reply.text ?? '', filePath, thread);
+                commentController.saveEditedComment(reply.thread, editing, reply.text ?? '');
             }
             else {
-                commentController.addReply(thread, reply.text ?? '');
+                addOrReply(commentController, reply);
             }
-            localCommentsProvider.refresh();
-            fileDecorationProvider.refresh();
-            changedFilesProvider.fireChange();
+            refreshCommentUi();
         }
-        catch (err) {
-            vscode.window.showErrorMessage(`Failed to save comment: ${err.message}`);
+        catch (error) {
+            vscode.window.showErrorMessage(`Failed to save comment: ${errorMessage(error)}`);
         }
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.cancelComment', (reply) => {
+    }), vscode.commands.registerCommand('localPrReview.cancelComment', (reply) => {
         if (reply.thread.comments.length === 0) {
             reply.thread.dispose();
         }
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.resolveThread', (thread) => {
+    }), vscode.commands.registerCommand('localPrReview.resolveThread', (thread) => {
         if (thread.state === vscode.CommentThreadState.Unresolved) {
             commentController.resolveThread(thread);
         }
         else {
             commentController.unresolveThread(thread);
         }
-        localCommentsProvider.refresh();
-        fileDecorationProvider.refresh();
-        changedFilesProvider.fireChange();
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.unresolveThread', (thread) => {
+        refreshCommentUi();
+    }), vscode.commands.registerCommand('localPrReview.unresolveThread', (thread) => {
         commentController.unresolveThread(thread);
-        localCommentsProvider.refresh();
-        fileDecorationProvider.refresh();
-        changedFilesProvider.fireChange();
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.editComment', (comment) => {
-        const thread = comment?.thread || comment?.parent || commentController.findThreadForComment(comment);
+        refreshCommentUi();
+    }), vscode.commands.registerCommand('localPrReview.editComment', (comment) => {
+        const thread = comment.thread
+            ?? comment.parent
+            ?? commentController.findThreadForComment(comment);
         if (!thread) {
             return;
         }
-        // VS Code only picks up mode changes when the comments array is reassigned.
-        thread.comments = thread.comments.map(c => {
-            if (c !== comment && !(c.author?.name === comment.author?.name
-                && (typeof c.body === 'string' ? c.body : c.body?.value)
-                    === (typeof comment.body === 'string' ? comment.body : comment.body?.value))) {
-                return { ...c, mode: vscode.CommentMode.Preview };
-            }
-            return { ...c, mode: vscode.CommentMode.Editing };
-        });
-    }));
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.deleteComment', async (comment) => {
-        // VS Code may pass the comment, or a wrapper; resolve the live thread either way.
-        const thread = comment?.thread || comment?.parent || commentController.findThreadForComment(comment);
+        for (const candidate of thread.comments) {
+            // Preserve the rendered comment object: the controller keeps
+            // its stable persisted UUID identity in a WeakMap.
+            candidate.mode = candidate === comment
+                ? vscode.CommentMode.Editing
+                : vscode.CommentMode.Preview;
+        }
+        thread.comments = [...thread.comments];
+    }), vscode.commands.registerCommand('localPrReview.deleteComment', async (comment) => {
+        const thread = comment.thread
+            ?? comment.parent
+            ?? commentController.findThreadForComment(comment);
         if (!thread) {
             vscode.window.showWarningMessage('Could not find that comment thread to delete.');
             return;
         }
         const answer = await vscode.window.showWarningMessage('Delete this comment?', { modal: true }, 'Delete');
+        if (answer === 'Delete') {
+            commentController.deleteComment(thread, comment);
+            refreshCommentUi();
+        }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.refreshPrs', () => {
+        localPrsProvider.refresh();
+    }), vscode.commands.registerCommand('localPrReview.refreshComments', () => {
+        reloadCommentsFromDisk();
+    }), vscode.commands.registerCommand('localPrReview.suggestChange', async (reply) => {
+        try {
+            const range = reply.thread.range;
+            if (!range) {
+                vscode.window.showWarningMessage('Select a line range in the diff to suggest a change.');
+                return;
+            }
+            const filePath = extractFilePath(reply.thread.uri);
+            const pendingReviewId = reply.thread.comments.length === 0
+                ? commentController.captureNewThreadReviewId(reply.thread.uri, filePath)
+                : undefined;
+            const document = await vscode.workspace.openTextDocument(reply.thread.uri);
+            const normalized = new vscode.Range(range.start.line, 0, range.end.line, document.lineAt(range.end.line).text.length);
+            const body = await suggestChangePanel_1.SuggestChangePanel.show(context.extensionUri, document.getText(normalized), filePath);
+            if (body === undefined) {
+                if (reply.thread.comments.length === 0) {
+                    reply.thread.dispose();
+                }
+                return;
+            }
+            if (reply.thread.comments.length === 0) {
+                commentController.createThread(reply.thread.uri, range, body, filePath, reply.thread, pendingReviewId);
+            }
+            else {
+                commentController.addReply(reply.thread, body);
+            }
+            refreshCommentUi();
+        }
+        catch (error) {
+            vscode.window.showErrorMessage(`Failed to add suggestion: ${errorMessage(error)}`);
+        }
+    }), vscode.commands.registerCommand('localPrReview.deleteCommentsFile', async (item) => {
+        const reviewId = typeof item === 'string' ? item : item.reviewId;
+        const review = localPrManager.getReviewById(reviewId);
+        if (!review) {
+            return;
+        }
+        const answer = await vscode.window.showWarningMessage(`Delete all comments for "${(0, types_1.formatReviewLabel)(review)}"?`, { modal: true }, 'Delete');
         if (answer !== 'Delete') {
             return;
         }
-        commentController.deleteComment(thread, comment);
-        localCommentsProvider.refresh();
-        fileDecorationProvider.refresh();
-        changedFilesProvider.fireChange();
-    }));
-    // Refresh commands for Local PRs and Local Comments
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.refreshPrs', () => {
-        localPrsProvider.refresh();
-    }), vscode.commands.registerCommand('localPrReview.refreshComments', async () => {
-        await reloadCommentsFromDisk();
-    }));
-    // Open all changed files in a multi-diff editor
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.openAllDiffs', async () => {
-        const allFiles = changedFilesProvider.getAllFileItems();
-        if (allFiles.length === 0) {
-            vscode.window.showInformationMessage('No changed files to show. Select branches first.');
-            return;
-        }
-        const { source, target } = changedFilesProvider.getBranches();
-        const isWorkingTree = source === target || await gitService.isCurrentBranch(target);
-        const resources = allFiles.map(item => {
-            const original = gitService.getFileUri(source, item.fileChange.filePath);
-            const modified = isWorkingTree
-                ? gitService.getWorkingTreeFileUri(item.fileChange.filePath)
-                : gitService.getFileUri(target, item.fileChange.filePath, 'modified');
-            return [original, modified, undefined];
+        transitionGeneration++;
+        await storageService.withWatchSuppressed(() => {
+            storageService.deleteCommentsForReview(reviewId);
         });
-        try {
-            await vscode.commands.executeCommand('vscode.changes', `Review: ${source} <-> ${target}`, resources);
+        if (localPrManager.getActiveReview()?.id === reviewId) {
+            await transitionToReview(review, {
+                ensureCommentsFile: false,
+            });
         }
-        catch (err) {
-            const msg = err?.message ?? String(err);
-            vscode.window.showErrorMessage(`Multi-diff editor failed: ${msg}`);
-        }
-    }));
-    // Suggest a Change — compose a diff suggestion as an inline comment
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.suggestChange', async (reply) => {
-        try {
-            const thread = reply.thread;
-            const range = thread.range;
-            if (!range) {
-                vscode.window.showWarningMessage('Please select a line range in the diff to suggest a change.');
-                return;
-            }
-            const doc = await vscode.workspace.openTextDocument(thread.uri);
-            const filePath = extractFilePath(thread.uri);
-            // Get the full lines covered by the selection
-            const normalizedRange = new vscode.Range(range.start.line, 0, range.end.line, doc.lineAt(range.end.line).text.length);
-            const originalCode = doc.getText(normalizedRange);
-            const commentBody = await suggestChangePanel_1.SuggestChangePanel.show(context.extensionUri, originalCode, filePath);
-            if (commentBody === undefined) {
-                // User cancelled — dispose empty thread
-                if (thread.comments.length === 0) {
-                    thread.dispose();
-                }
-                return;
-            }
-            if (thread.comments.length === 0) {
-                commentController.createThread(thread.uri, range, commentBody, filePath);
-                thread.dispose();
-            }
-            else {
-                commentController.addReply(thread, commentBody);
-            }
+        else {
             localCommentsProvider.refresh();
-            fileDecorationProvider.refresh();
-            changedFilesProvider.fireChange();
-        }
-        catch (err) {
-            vscode.window.showErrorMessage(`Failed to add suggestion: ${err.message}`);
         }
     }));
-    // Delete comments file
-    context.subscriptions.push(vscode.commands.registerCommand('localPrReview.deleteCommentsFile', async (item) => {
-        const answer = await vscode.window.showWarningMessage('Delete all comments for this review?', { modal: true }, 'Delete');
-        if (answer === 'Delete') {
-            const fs = await Promise.resolve().then(() => __importStar(require('fs')));
-            const path = await Promise.resolve().then(() => __importStar(require('path')));
-            if (fs.existsSync(item.filePath)) {
-                fs.unlinkSync(item.filePath);
-                const dir = path.dirname(item.filePath);
-                const remaining = fs.readdirSync(dir);
-                if (remaining.length === 0) {
-                    fs.rmdirSync(dir);
-                }
-            }
-            localCommentsProvider.refresh();
-            await commentController.loadAllThreads();
-            fileDecorationProvider.refresh();
-        }
-    }));
-    // Disposables
     context.subscriptions.push(branchSelectorProvider, changedFilesProvider, localPrsProvider, localCommentsProvider, commentController, gitFileContentProvider, fileDecorationProvider, { dispose: () => localPrManager.dispose() });
+}
+function addOrReply(controller, reply) {
+    const thread = reply.thread;
+    const filePath = extractFilePath(thread.uri);
+    const range = thread.range ?? new vscode.Range(0, 0, 0, 0);
+    if (!filePath) {
+        throw new Error('Could not resolve the comment file path');
+    }
+    if (thread.comments.length === 0) {
+        controller.createThread(thread.uri, range, reply.text ?? '', filePath, thread);
+    }
+    else {
+        controller.addReply(thread, reply.text ?? '');
+    }
 }
 function extractFilePath(uri) {
     if (uri.scheme === 'file') {
         return vscode.workspace.asRelativePath(uri, false);
     }
-    const path = uri.path;
-    return path.startsWith('/') ? path.slice(1) : path;
+    return uri.path.startsWith('/') ? uri.path.slice(1) : uri.path;
+}
+function errorMessage(error) {
+    return error instanceof Error ? error.message : String(error);
 }
 function deactivate() { }
 //# sourceMappingURL=extension.js.map

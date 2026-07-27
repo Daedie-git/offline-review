@@ -1,4 +1,5 @@
 node_modules/
+.vscode/local-reviews/
 .vscode/offline-review/
 *.vsix
 .DS_Store

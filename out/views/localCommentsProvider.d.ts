@@ -1,8 +1,9 @@
 import * as vscode from 'vscode';
+import { CommentFileDiscovery, ReviewMode } from '../types';
 import { StorageService } from '../storage/storageService';
 export declare class LocalCommentsProvider implements vscode.TreeDataProvider<CommentFileItem> {
-    private storageService;
-    private _onDidChangeTreeData;
+    private readonly storageService;
+    private readonly _onDidChangeTreeData;
     readonly onDidChangeTreeData: vscode.Event<CommentFileItem | undefined>;
     constructor(storageService: StorageService);
     getTreeItem(element: CommentFileItem): vscode.TreeItem;
@@ -11,6 +12,8 @@ export declare class LocalCommentsProvider implements vscode.TreeDataProvider<Co
     dispose(): void;
 }
 export declare class CommentFileItem extends vscode.TreeItem {
+    readonly reviewId: string;
+    readonly mode: ReviewMode;
     readonly filePath: string;
-    constructor(reviewLabel: string, filePath: string, isActive: boolean);
+    constructor(discovery: CommentFileDiscovery);
 }

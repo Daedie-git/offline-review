@@ -96,7 +96,7 @@ class SuggestChangePanel {
         ];
         return diffLines.join('\n');
     }
-    getHtml(webview) {
+    getHtml(_webview) {
         const nonce = getNonce();
         // Safely embed the original code as a JSON string to avoid escaping issues
         const originalJson = JSON.stringify(this.originalCode);

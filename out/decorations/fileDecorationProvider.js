@@ -35,6 +35,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ReviewFileDecorationProvider = void 0;
 const vscode = __importStar(require("vscode"));
+const path = __importStar(require("path"));
 class ReviewFileDecorationProvider {
     constructor(storageService) {
         this.storageService = storageService;
@@ -50,15 +51,11 @@ class ReviewFileDecorationProvider {
         if (!workspaceRoot) {
             return undefined;
         }
-        // Get relative path from workspace root
-        const absolutePath = uri.fsPath;
-        if (!absolutePath.startsWith(workspaceRoot)) {
+        const relative = path.relative(workspaceRoot, uri.fsPath);
+        if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
             return undefined;
         }
-        const relativePath = absolutePath
-            .slice(workspaceRoot.length)
-            .replace(/\\/g, '/')
-            .replace(/^\//, '');
+        const relativePath = relative.replace(/\\/g, '/');
         const count = this.getUnresolvedCount(relativePath);
         if (count === 0) {
             return undefined;

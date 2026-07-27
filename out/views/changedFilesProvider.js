@@ -35,6 +35,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.MessageItem = exports.CommitItem = exports.FileChangeItem = exports.FolderItem = exports.SectionItem = exports.ChangedFilesProvider = void 0;
 const vscode = __importStar(require("vscode"));
+const types_1 = require("../types");
 class ChangedFilesProvider {
     constructor(gitService, storageService, localPrManager) {
         this.gitService = gitService;
@@ -44,9 +45,8 @@ class ChangedFilesProvider {
         this.onDidChangeTreeData = this._onDidChangeTreeData.event;
         this.files = [];
         this.commits = [];
-        this.sourceBranch = '';
-        this.targetBranch = '';
         this.reviewedFiles = new Set();
+        this.requestGeneration = 0;
         this.reviewedFiles = new Set(localPrManager.getReviewedFiles());
     }
     getTreeItem(element) {
@@ -74,14 +74,17 @@ class ChangedFilesProvider {
         return undefined;
     }
     buildRootSections() {
-        if (this.files.length === 0 && this.commits.length === 0) {
-            if (this.sourceBranch && this.targetBranch) {
-                return [new MessageItem('No changes between these branches', 'The base and compare branches are identical.')];
-            }
+        this.filesSection = undefined;
+        this.commitsSection = undefined;
+        if (!this.plan) {
             return [];
         }
-        const fileChildren = this.buildFileTree();
-        this.filesSection = new SectionItem('Files', 'files', fileChildren, this.files.length);
+        if (this.files.length === 0 && this.commits.length === 0) {
+            return this.plan.kind === 'worktree'
+                ? [new MessageItem('No uncommitted changes', 'HEAD and the working tree are identical.')]
+                : [new MessageItem('No changes between these branches', 'The saved target commit matches its merge base.')];
+        }
+        this.filesSection = new SectionItem('Files', 'files', this.buildFileTree(), this.files.length);
         this.commitsSection = new SectionItem('Commits', 'commits', this.buildCommitList(), this.commits.length, vscode.TreeItemCollapsibleState.Collapsed);
         return [this.filesSection, this.commitsSection];
     }
@@ -90,35 +93,37 @@ class ChangedFilesProvider {
         const groups = new Map();
         const rootFiles = [];
         for (const file of this.files) {
-            const slashIdx = file.filePath.lastIndexOf('/');
-            if (slashIdx === -1) {
+            const slashIndex = file.filePath.lastIndexOf('/');
+            if (slashIndex === -1) {
                 rootFiles.push(file);
             }
             else {
-                const dir = file.filePath.substring(0, slashIdx);
-                if (!groups.has(dir)) {
-                    groups.set(dir, []);
-                }
-                groups.get(dir).push(file);
+                const directory = file.filePath.substring(0, slashIndex);
+                const directoryFiles = groups.get(directory) ?? [];
+                directoryFiles.push(file);
+                groups.set(directory, directoryFiles);
             }
         }
         const items = [];
-        const sortedDirs = Array.from(groups.keys()).sort();
-        for (const dir of sortedDirs) {
-            const dirFiles = groups.get(dir);
-            const children = dirFiles.map(f => this.createFileItem(f, commentCounts, true));
-            items.push(new FolderItem(dir, children));
+        for (const directory of [...groups.keys()].sort()) {
+            const children = (groups.get(directory) ?? [])
+                .sort((left, right) => left.filePath.localeCompare(right.filePath))
+                .map(file => this.createFileItem(file, commentCounts, true));
+            items.push(new FolderItem(directory, children));
         }
-        for (const file of rootFiles.sort((a, b) => a.filePath.localeCompare(b.filePath))) {
+        for (const file of rootFiles.sort((left, right) => left.filePath.localeCompare(right.filePath))) {
             items.push(this.createFileItem(file, commentCounts, false));
         }
         return items;
     }
     buildCommitList() {
-        return this.commits.map(c => new CommitItem(c));
+        return this.commits.map(commit => new CommitItem(commit));
     }
     createFileItem(file, commentCounts, useBasename) {
-        const item = new FileChangeItem(file, this.sourceBranch, this.targetBranch, commentCounts.get(file.filePath) || 0, useBasename);
+        if (!this.plan) {
+            throw new Error('Cannot create a changed-file item without a DiffPlan');
+        }
+        const item = new FileChangeItem(file, this.plan, this.gitService.getFileDiffUris(this.plan, file), commentCounts.get(file.filePath) ?? 0, useBasename);
         item.checkboxState = this.reviewedFiles.has(file.filePath)
             ? vscode.TreeItemCheckboxState.Checked
             : vscode.TreeItemCheckboxState.Unchecked;
@@ -126,12 +131,17 @@ class ChangedFilesProvider {
     }
     getCommentCounts() {
         const counts = new Map();
-        const comments = this.storageService.loadComments();
-        if (comments) {
-            for (const thread of comments.threads) {
-                if (thread.state !== 'resolved') {
-                    counts.set(thread.filePath, (counts.get(thread.filePath) || 0) + 1);
-                }
+        if (!this.plan) {
+            return counts;
+        }
+        const comments = this.storageService.loadCommentsForReview(this.plan.reviewId);
+        if (!comments) {
+            return counts;
+        }
+        for (const thread of comments.threads) {
+            if (thread.state !== 'resolved'
+                && (0, types_1.isThreadCurrentForPlan)(thread, this.plan)) {
+                counts.set(thread.target.filePath, (counts.get(thread.target.filePath) ?? 0) + 1);
             }
         }
         return counts;
@@ -143,32 +153,83 @@ class ChangedFilesProvider {
         else {
             this.reviewedFiles.delete(filePath);
         }
-        this.localPrManager.setReviewedFiles(Array.from(this.reviewedFiles));
+        const activeReview = this.localPrManager.getActiveReview();
+        if (activeReview && activeReview.id === this.plan?.reviewId) {
+            this.localPrManager.setReviewedFiles([...this.reviewedFiles]);
+        }
     }
-    async refresh(sourceBranch, targetBranch) {
-        this.sourceBranch = sourceBranch;
-        this.targetBranch = targetBranch;
-        this.reviewedFiles = new Set(this.localPrManager.getReviewedFiles());
-        if (!sourceBranch || !targetBranch) {
-            this.files = [];
-            this.commits = [];
-            this._onDidChangeTreeData.fire(undefined);
-            return;
-        }
+    /**
+     * Resolve and query a review without changing visible provider state. This is
+     * the async half used by an extension coordinator before an atomic apply.
+     */
+    async prepareRefresh(input) {
+        const plan = isDiffPlan(input)
+            ? freezeDiffPlan(input)
+            : await this.gitService.prepareDiffPlan(input);
+        const review = isDiffPlan(input)
+            ? this.localPrManager.listReviews().find(candidate => candidate.id === plan.reviewId)
+            : input;
+        const [files, commits] = await Promise.all([
+            this.gitService.getChangedFiles(plan),
+            this.gitService.getCommitsForDiff(plan),
+        ]);
+        return Object.freeze({
+            plan,
+            files: Object.freeze(files.map(file => Object.freeze({ ...file }))),
+            commits: Object.freeze(commits.map(commit => Object.freeze({ ...commit }))),
+            reviewedFiles: Object.freeze([...(review?.reviewedFiles ?? [])]),
+        });
+    }
+    /**
+     * Synchronously publish a prepared state and invalidate older async refreshes.
+     * Coordinators can apply this and then update comments/decorations as one turn.
+     */
+    applyPreparedState(state) {
+        this.requestGeneration++;
+        this.commitPreparedState(state);
+    }
+    /** Prepare and apply unless a newer request supersedes this one. */
+    async refresh(input) {
+        const generation = ++this.requestGeneration;
         try {
-            const [files, commits] = await Promise.all([
-                this.gitService.getChangedFiles(sourceBranch, targetBranch),
-                this.gitService.getCommitsBetween(sourceBranch, targetBranch),
-            ]);
-            this.files = files;
-            this.commits = commits;
+            const state = await this.prepareRefresh(input);
+            if (generation !== this.requestGeneration) {
+                return false;
+            }
+            this.commitPreparedState(state);
+            return true;
         }
-        catch (e) {
-            vscode.window.showErrorMessage(`Failed to get changed files: ${e.message}`);
+        catch (error) {
+            if (generation !== this.requestGeneration) {
+                return false;
+            }
             this.files = [];
             this.commits = [];
+            this.plan = undefined;
+            this.preparedState = undefined;
+            this.filesSection = undefined;
+            this.commitsSection = undefined;
+            const message = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(`Failed to prepare review diff: ${message}`);
+            this._onDidChangeTreeData.fire(undefined);
+            return false;
         }
+    }
+    commitPreparedState(state) {
+        this.preparedState = state;
+        this.plan = state.plan;
+        this.files = state.files;
+        this.commits = state.commits;
+        this.reviewedFiles = new Set(state.reviewedFiles);
+        this.filesSection = undefined;
+        this.commitsSection = undefined;
         this._onDidChangeTreeData.fire(undefined);
+    }
+    getPreparedState() {
+        return this.preparedState;
+    }
+    getDiffPlan() {
+        return this.plan;
     }
     getAllExpandableItems() {
         const items = [];
@@ -200,25 +261,27 @@ class ChangedFilesProvider {
         }
         return items;
     }
-    /**
-     * Get all changed file paths directly (not dependent on tree rendering).
-     */
     getAllFilePaths() {
-        return this.files.map(f => f.filePath);
-    }
-    getBranches() {
-        return { source: this.sourceBranch, target: this.targetBranch };
+        return this.files.map(file => file.filePath);
     }
     clear() {
+        this.requestGeneration++;
         this.files = [];
         this.commits = [];
+        this.plan = undefined;
+        this.preparedState = undefined;
         this.reviewedFiles.clear();
+        this.filesSection = undefined;
+        this.commitsSection = undefined;
         this._onDidChangeTreeData.fire(undefined);
     }
     fireChange() {
+        this.filesSection = undefined;
+        this.commitsSection = undefined;
         this._onDidChangeTreeData.fire(undefined);
     }
     dispose() {
+        this.requestGeneration++;
         this._onDidChangeTreeData.dispose();
     }
 }
@@ -247,7 +310,6 @@ class FolderItem extends vscode.TreeItem {
         this.iconPath = vscode.ThemeIcon.Folder;
         this.contextValue = 'folder';
         this.description = `${children.length}`;
-        // Set resourceUri so FileDecorationProvider can propagate decorations to folders
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
         if (workspaceRoot) {
             this.resourceUri = vscode.Uri.joinPath(workspaceRoot, folderPath);
@@ -256,22 +318,25 @@ class FolderItem extends vscode.TreeItem {
 }
 exports.FolderItem = FolderItem;
 class FileChangeItem extends vscode.TreeItem {
-    constructor(fileChange, sourceBranch, targetBranch, commentCount = 0, useBasename = false) {
+    constructor(fileChange, diffPlan, uris, commentCount = 0, useBasename = false) {
         const displayName = useBasename
             ? fileChange.filePath.substring(fileChange.filePath.lastIndexOf('/') + 1)
             : fileChange.filePath;
         super(displayName, vscode.TreeItemCollapsibleState.None);
         this.fileChange = fileChange;
-        this.sourceBranch = sourceBranch;
-        this.targetBranch = targetBranch;
+        this.diffPlan = diffPlan;
         this.commentCount = commentCount;
-        // Set resourceUri so FileDecorationProvider can show comment badges
+        this.leftUri = uris.left;
+        this.rightUri = uris.right;
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
         if (workspaceRoot) {
             this.resourceUri = vscode.Uri.joinPath(workspaceRoot, fileChange.filePath);
         }
         const statusLabel = fileChange.status.charAt(0).toUpperCase();
-        this.tooltip = `${fileChange.status}: ${fileChange.filePath}${commentCount > 0 ? ` (${commentCount} unresolved comment${commentCount > 1 ? 's' : ''})` : ''}`;
+        const commentLabel = commentCount > 0
+            ? ` (${commentCount} unresolved comment${commentCount === 1 ? '' : 's'})`
+            : '';
+        this.tooltip = `${fileChange.status}: ${fileChange.filePath}${commentLabel}`;
         this.description = commentCount > 0 ? `${statusLabel}  💬 ${commentCount}` : statusLabel;
         this.contextValue = 'fileChange';
         switch (fileChange.status) {
@@ -316,4 +381,40 @@ class MessageItem extends vscode.TreeItem {
     }
 }
 exports.MessageItem = MessageItem;
+function isDiffPlan(value) {
+    return 'kind' in value && (value.kind === 'branch' || value.kind === 'worktree');
+}
+function freezeDiffPlan(plan) {
+    if (plan.kind === 'branch') {
+        const left = Object.freeze({ kind: 'git', ref: plan.left.ref });
+        const right = Object.freeze({ kind: 'git', ref: plan.right.ref });
+        return Object.freeze({
+            kind: 'branch',
+            reviewId: plan.reviewId,
+            baseBranch: plan.baseBranch,
+            targetBranch: plan.targetBranch,
+            baseCommit: plan.baseCommit,
+            mergeBaseCommit: plan.mergeBaseCommit,
+            targetCommit: plan.targetCommit,
+            left,
+            right,
+        });
+    }
+    const left = Object.freeze({ kind: 'git', ref: plan.left.ref });
+    const right = Object.freeze({
+        kind: 'worktree',
+        reviewId: plan.right.reviewId,
+        headCommit: plan.right.headCommit,
+        planId: plan.right.planId,
+    });
+    return Object.freeze({
+        kind: 'worktree',
+        reviewId: plan.reviewId,
+        branch: plan.branch,
+        headCommit: plan.headCommit,
+        planId: plan.planId,
+        left,
+        right,
+    });
+}
 //# sourceMappingURL=changedFilesProvider.js.map

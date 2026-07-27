@@ -35,6 +35,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.LocalReviewTool = void 0;
 const vscode = __importStar(require("vscode"));
+const types_1 = require("../types");
 class LocalReviewTool {
     constructor(gitService, localPrManager, storageService) {
         this.gitService = gitService;
@@ -50,81 +51,69 @@ class LocalReviewTool {
     }
     async invoke(options, _token) {
         const { filePath, state } = options.input;
-        // Auto-detect review from current git branch
         const review = await this.resolveReview();
         if (!review) {
-            return new vscode.LanguageModelToolResult([
-                new vscode.LanguageModelTextPart('No offline review exists for the current git branch. '
-                    + 'Tell the user: "No offline review found. Open the **Offline Review** sidebar (activity bar icon), '
-                    + 'pick Uncommitted or Active branch, then add comments in the diff views. '
-                    + 'After that, you can ask me to check them." '
-                    + 'Do NOT search the filesystem or run any commands — offline review data is only accessible through this tool.'),
-            ]);
+            return textResult('No offline review exists for the current git branch. '
+                + 'Tell the user: "No offline review found. Open the **Offline Review** sidebar, '
+                + 'pick Uncommitted or Active branch, then add comments in a diff view." '
+                + 'Do NOT search the filesystem or run commands; review data is available through this tool.');
         }
-        // Temporarily set as active to read comments
-        const previousActive = this.localPrManager.getActiveReview();
-        this.localPrManager.setActiveReview(review.id);
-        const comments = this.storageService.loadComments();
-        // Restore previous active if different
-        if (previousActive && previousActive.id !== review.id) {
-            this.localPrManager.setActiveReview(previousActive.id);
-        }
+        // UUID-specific reads avoid activating a different review as a side effect.
+        const comments = this.storageService.loadCommentsForReview(review);
+        const label = (0, types_1.formatReviewLabel)(review);
         if (!comments || comments.threads.length === 0) {
-            return new vscode.LanguageModelToolResult([
-                new vscode.LanguageModelTextPart(`Review found: ${review.targetBranch} -> ${review.sourceBranch}. `
-                    + 'However, there are no comments yet. '
-                    + 'Tell the user: "Your review has no comments yet. Open a file from the Changed Files list '
-                    + 'in the Offline Review sidebar, then click the + icon in the diff gutter to add a comment." '
-                    + 'Do NOT search the filesystem or run any commands.'),
-            ]);
+            return textResult(`Review found: ${label}. However, there are no comments yet. `
+                + 'Tell the user to open a file from Changed Files and use the diff gutter to add a comment.');
         }
         let threads = comments.threads;
-        // Filter by file path if specified
         if (filePath) {
-            threads = threads.filter(t => t.filePath.includes(filePath));
+            threads = threads.filter(thread => thread.filePath.includes(filePath));
         }
-        // Filter by state if specified
         if (state) {
-            threads = threads.filter(t => t.state === state);
+            threads = threads.filter(thread => thread.state === state);
         }
+        const comparison = (0, types_1.getReviewSourceTarget)(review);
         const result = {
             review: {
-                baseBranch: review.sourceBranch,
-                compareBranch: review.targetBranch,
+                id: review.id,
+                mode: review.mode,
+                label,
+                baseBranch: comparison.sourceBranch,
+                compareBranch: comparison.targetBranch,
             },
             totalThreads: comments.threads.length,
-            unresolvedCount: comments.threads.filter(t => t.state === 'unresolved').length,
-            resolvedCount: comments.threads.filter(t => t.state === 'resolved').length,
-            threads: threads.map(t => ({
-                id: t.id,
-                filePath: t.filePath,
-                startLine: t.startLine,
-                endLine: t.endLine,
-                state: t.state,
-                comments: t.comments.map(c => ({
-                    author: c.author,
-                    body: c.body,
-                    timestamp: c.timestamp,
+            unresolvedCount: comments.threads.filter(thread => thread.state === 'unresolved').length,
+            resolvedCount: comments.threads.filter(thread => thread.state === 'resolved').length,
+            threads: threads.map(thread => ({
+                id: thread.id,
+                filePath: thread.filePath,
+                startLine: thread.startLine,
+                endLine: thread.endLine,
+                state: thread.state,
+                comments: thread.comments.map(comment => ({
+                    author: comment.author,
+                    body: comment.body,
+                    timestamp: comment.timestamp,
                 })),
             })),
         };
-        return new vscode.LanguageModelToolResult([
-            new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2)),
-        ]);
+        return textResult(JSON.stringify(result, null, 2));
     }
     async resolveReview() {
-        // Prefer the active review — Uncommitted and Active-branch are separate
-        // buckets that can both match the current branch name.
+        // Active UUID is authoritative because branch and uncommitted reviews can
+        // intentionally share a branch name while remaining separate buckets.
         const active = this.localPrManager.getActiveReview();
         if (active) {
             return active;
         }
         const currentBranch = await this.gitService.getCurrentBranch();
-        if (currentBranch) {
-            return this.localPrManager.findReviewByBranch(currentBranch);
-        }
-        return undefined;
+        return currentBranch
+            ? this.localPrManager.findReviewByBranch(currentBranch, this.localPrManager.getActiveMode())
+            : undefined;
     }
 }
 exports.LocalReviewTool = LocalReviewTool;
+function textResult(text) {
+    return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(text)]);
+}
 //# sourceMappingURL=localReviewTool.js.map

@@ -35,10 +35,10 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.GitFileContentProvider = void 0;
 const vscode = __importStar(require("vscode"));
-const gitService_1 = require("./gitService");
+const gitService_1 = require("../git/gitService");
 /**
- * Provides file content from a specific git ref via a custom URI scheme.
- * URI format: git-local-review://authority/{filePath}?ref={branch|WORKTREE}
+ * Provides Git-object and WORKTREE content via the review's virtual URI scheme.
+ * WORKTREE URIs include the owning review UUID and prepared HEAD commit.
  */
 class GitFileContentProvider {
     constructor(gitService) {
@@ -47,26 +47,30 @@ class GitFileContentProvider {
         this.onDidChange = this._onDidChange.event;
     }
     async provideTextDocumentContent(uri) {
-        const filePath = uri.path.startsWith('/') ? uri.path.slice(1) : uri.path;
-        const params = new URLSearchParams(uri.query);
-        const ref = params.get('ref');
-        if (!ref) {
+        const parsed = (0, gitService_1.parseDiffDocumentUri)(uri);
+        if (!parsed) {
             return '';
         }
-        return this.gitService.getFileContent(ref, filePath);
+        const ref = parsed.document.kind === 'worktree'
+            ? gitService_1.GitService.WORKTREE_REF
+            : parsed.document.ref;
+        return this.gitService.getFileContent(ref, parsed.filePath);
     }
-    /** Invalidate a cached WORKTREE virtual document so the diff right pane refreshes. */
+    /** Invalidate every open WORKTREE identity for one real file. */
     refreshWorkingTreeFile(filePath) {
-        this._onDidChange.fire(this.gitService.getWorkingTreeFileUri(filePath));
-    }
-    refreshAllWorkingTree() {
-        for (const doc of vscode.workspace.textDocuments) {
-            if (doc.uri.scheme !== 'git-local-review') {
-                continue;
+        for (const document of vscode.workspace.textDocuments) {
+            const parsed = (0, gitService_1.parseDiffDocumentUri)(document.uri);
+            if (parsed?.document.kind === 'worktree' && parsed.filePath === filePath) {
+                this._onDidChange.fire(document.uri);
             }
-            const ref = new URLSearchParams(doc.uri.query).get('ref');
-            if (ref === gitService_1.GitService.WORKTREE_REF) {
-                this._onDidChange.fire(doc.uri);
+        }
+    }
+    /** Invalidate every open WORKTREE virtual document. */
+    refreshAllWorkingTree() {
+        for (const document of vscode.workspace.textDocuments) {
+            const parsed = (0, gitService_1.parseDiffDocumentUri)(document.uri);
+            if (parsed?.document.kind === 'worktree') {
+                this._onDidChange.fire(document.uri);
             }
         }
     }
