@@ -54,7 +54,7 @@ class ReviewCommentController {
                     }
                     if (this.activePlan) {
                         const filePath = uriFilePath(document.uri);
-                        const expected = (0, gitService_1.getDiffDocumentUri)(this.activePlan.right, filePath, 'modified', this.activePlan.reviewId);
+                        const expected = (0, gitService_1.getDiffDocumentUri)(this.activePlan.right, filePath, 'modified', this.activePlan.reviewId, this.activePlan.worktreeRoot);
                         if (document.uri.toString() !== expected.toString()) {
                             return [];
                         }
@@ -89,7 +89,7 @@ class ReviewCommentController {
             if (this.activePlan && this.activePlan !== plan) {
                 return;
             }
-            const expected = (0, gitService_1.getDiffDocumentUri)(plan.right, filePath, 'modified', plan.reviewId);
+            const expected = (0, gitService_1.getDiffDocumentUri)(plan.right, filePath, 'modified', plan.reviewId, plan.worktreeRoot);
             if (targetUri.toString() !== expected.toString()) {
                 return;
             }
@@ -128,7 +128,7 @@ class ReviewCommentController {
         }
         for (const thread of comments.threads) {
             const target = thread.target;
-            const targetUri = threadTargetUri(target, plan.reviewId);
+            const targetUri = threadTargetUri(target, plan);
             this.createVscodeThread(plan.reviewId, targetUri, thread, threadKey(thread.id, targetUri));
         }
     }
@@ -157,7 +157,7 @@ class ReviewCommentController {
             throw new Error('No prepared review is active');
         }
         if (uri.scheme === 'git-local-review') {
-            const expected = (0, gitService_1.getDiffDocumentUri)(plan.right, filePath, 'modified', plan.reviewId);
+            const expected = (0, gitService_1.getDiffDocumentUri)(plan.right, filePath, 'modified', plan.reviewId, plan.worktreeRoot);
             if (uri.toString() !== expected.toString()) {
                 throw new Error('Comments can only be added to the prepared diff target');
             }
@@ -404,15 +404,24 @@ function targetFromPlan(plan, filePath) {
             filePath,
         };
 }
-function threadTargetUri(target, reviewId) {
+function threadTargetUri(target, plan) {
+    const currentWorktreeTarget = target.kind === 'worktree'
+        && plan.kind === 'worktree'
+        && target.reviewId === plan.reviewId
+        && target.headCommit === plan.headCommit;
     const document = target.kind === 'git'
         ? { kind: 'git', ref: target.ref }
         : {
             kind: 'worktree',
-            reviewId,
+            reviewId: plan.reviewId,
             headCommit: target.headCommit,
-            planId: target.planId,
+            // The URI nonce changes on refresh to invalidate VS Code's cache,
+            // while same-HEAD comments remain attached to the current document.
+            planId: currentWorktreeTarget ? plan.planId : target.planId,
+            // The persisted schema intentionally remains unchanged. During this
+            // activation, thread documents use the prepared checkout identity.
+            worktreeRoot: plan.worktreeRoot,
         };
-    return (0, gitService_1.getDiffDocumentUri)(document, target.filePath, 'modified', reviewId);
+    return (0, gitService_1.getDiffDocumentUri)(document, target.filePath, 'modified', plan.reviewId, plan.worktreeRoot);
 }
 //# sourceMappingURL=commentController.js.map

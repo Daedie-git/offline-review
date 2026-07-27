@@ -109,7 +109,7 @@ class ChangedFilesProvider {
             const children = (groups.get(directory) ?? [])
                 .sort((left, right) => left.filePath.localeCompare(right.filePath))
                 .map(file => this.createFileItem(file, commentCounts, true));
-            items.push(new FolderItem(directory, children));
+            items.push(new FolderItem(directory, children, this.plan?.worktreeRoot));
         }
         for (const file of rootFiles.sort((left, right) => left.filePath.localeCompare(right.filePath))) {
             items.push(this.createFileItem(file, commentCounts, false));
@@ -303,16 +303,15 @@ class SectionItem extends vscode.TreeItem {
 }
 exports.SectionItem = SectionItem;
 class FolderItem extends vscode.TreeItem {
-    constructor(folderPath, children) {
+    constructor(folderPath, children, worktreeRoot) {
         super(folderPath, vscode.TreeItemCollapsibleState.Expanded);
         this.folderPath = folderPath;
         this.children = children;
         this.iconPath = vscode.ThemeIcon.Folder;
         this.contextValue = 'folder';
         this.description = `${children.length}`;
-        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
-        if (workspaceRoot) {
-            this.resourceUri = vscode.Uri.joinPath(workspaceRoot, folderPath);
+        if (worktreeRoot) {
+            this.resourceUri = vscode.Uri.joinPath(vscode.Uri.file(worktreeRoot), folderPath);
         }
     }
 }
@@ -328,10 +327,7 @@ class FileChangeItem extends vscode.TreeItem {
         this.commentCount = commentCount;
         this.leftUri = uris.left;
         this.rightUri = uris.right;
-        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
-        if (workspaceRoot) {
-            this.resourceUri = vscode.Uri.joinPath(workspaceRoot, fileChange.filePath);
-        }
+        this.resourceUri = vscode.Uri.joinPath(vscode.Uri.file(diffPlan.worktreeRoot), fileChange.filePath);
         const statusLabel = fileChange.status.charAt(0).toUpperCase();
         const commentLabel = commentCount > 0
             ? ` (${commentCount} unresolved comment${commentCount === 1 ? '' : 's'})`
@@ -391,6 +387,7 @@ function freezeDiffPlan(plan) {
         return Object.freeze({
             kind: 'branch',
             reviewId: plan.reviewId,
+            worktreeRoot: plan.worktreeRoot,
             baseBranch: plan.baseBranch,
             targetBranch: plan.targetBranch,
             baseCommit: plan.baseCommit,
@@ -406,10 +403,12 @@ function freezeDiffPlan(plan) {
         reviewId: plan.right.reviewId,
         headCommit: plan.right.headCommit,
         planId: plan.right.planId,
+        worktreeRoot: plan.right.worktreeRoot,
     });
     return Object.freeze({
         kind: 'worktree',
         reviewId: plan.reviewId,
+        worktreeRoot: plan.worktreeRoot,
         branch: plan.branch,
         headCommit: plan.headCommit,
         planId: plan.planId,

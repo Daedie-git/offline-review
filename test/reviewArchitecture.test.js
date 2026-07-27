@@ -155,6 +155,169 @@ test('branch plans exclude worktree edits while worktree plans include them', as
     );
 });
 
+test('linked worktree selection drives both modes and prepared URIs retain their root', async () => {
+    const repository = temporaryDirectory('offline-review-worktrees-');
+    const externalContainer = temporaryDirectory('offline-review-linked-parent-');
+    const external = path.join(externalContainer, 'linked checkout with spaces');
+    installVscodeMock(repository);
+    git(repository, 'init', '-b', 'main');
+    git(repository, 'config', 'user.name', 'Offline Review Test');
+    git(repository, 'config', 'user.email', 'offline-review@example.invalid');
+    write(repository, 'base.txt', 'base\n');
+    const baseCommit = commit(repository, 'base');
+    git(repository, 'worktree', 'add', '-b', 'linked-feature', external);
+    write(external, 'external-commit.txt', 'committed in linked worktree\n');
+    const externalCommit = commit(external, 'linked worktree commit');
+    write(external, 'external-dirty.txt', 'uncommitted in linked worktree\n');
+    write(repository, 'local-dirty.txt', 'uncommitted in Local\n');
+
+    const { GitService, parseDiffDocumentUri, parseWorktreeList } = built('git/gitService');
+    const service = new GitService({ subscriptions: [] });
+    assert.equal(service.getSelectedWorktreeRoot(), repository, 'Local is the session default');
+
+    const listed = await service.listWorktrees();
+    assert.equal(listed.length, 2);
+    assert.equal(listed.find(worktree => worktree.isLocal).root, repository);
+    const linked = listed.find(worktree => worktree.root === external);
+    assert.deepEqual(
+        { branch: linked.branch, detached: linked.detached },
+        { branch: 'linked-feature', detached: false }
+    );
+
+    let selectionEvents = 0;
+    service.onDidChangeWorktreeSelection(() => selectionEvents++);
+    await assert.rejects(
+        service.selectWorktree(path.join(externalContainer, 'vanished worktree')),
+        /no longer linked/
+    );
+    await service.selectWorktree(external);
+    assert.equal(selectionEvents, 1);
+    assert.equal(await service.getCurrentBranch(), 'linked-feature');
+
+    const branchReview = {
+        id: '33333333-3333-4333-8333-333333333333',
+        mode: 'branch',
+        baseBranch: 'main',
+        targetBranch: 'linked-feature',
+        sourceCommit: baseCommit,
+        targetCommit: externalCommit,
+        createdAt: new Date(0).toISOString(),
+    };
+    const branchPlan = await service.prepareDiffPlan(branchReview);
+    assert.equal(branchPlan.worktreeRoot, external);
+    assert.deepEqual(
+        (await service.getChangedFiles(branchPlan)).map(change => change.filePath),
+        ['external-commit.txt']
+    );
+
+    const uncommittedReview = {
+        id: '44444444-4444-4444-8444-444444444444',
+        mode: 'uncommitted',
+        branch: 'linked-feature',
+        sourceCommit: externalCommit,
+        targetCommit: externalCommit,
+        createdAt: new Date(0).toISOString(),
+    };
+    const externalPlan = await service.prepareDiffPlan(uncommittedReview);
+    assert.deepEqual(
+        (await service.getChangedFiles(externalPlan)).map(change => change.filePath),
+        ['external-dirty.txt']
+    );
+    const externalUri = service.getFileDiffUris(externalPlan, {
+        status: 'added',
+        filePath: 'external-dirty.txt',
+    }).right;
+    assert.equal(parseDiffDocumentUri(externalUri).document.worktreeRoot, external);
+
+    await service.selectWorktree(repository);
+    assert.equal(await service.getCurrentBranch(), 'main');
+    const parsedOldUri = parseDiffDocumentUri(externalUri);
+    assert.equal(
+        await service.getFileContent(parsedOldUri.document, parsedOldUri.filePath),
+        'uncommitted in linked worktree\n'
+    );
+
+    const synthetic = [
+        `worktree ${path.join(externalContainer, 'path with spaces')}`,
+        `HEAD ${'a'.repeat(40)}`,
+        'detached',
+        '',
+        `worktree ${path.join(externalContainer, 'stale checkout')}`,
+        `HEAD ${'b'.repeat(40)}`,
+        'prunable gitdir file points to non-existent location',
+        '',
+        '',
+    ].join('\0');
+    assert.deepEqual(parseWorktreeList(synthetic, repository), [{
+        root: path.join(externalContainer, 'path with spaces'),
+        headCommit: 'a'.repeat(40),
+        branch: undefined,
+        detached: true,
+        isLocal: false,
+    }]);
+
+    // A registered path replaced by an unrelated repository must not remain an
+    // authorization token for old virtual documents or live Git operations.
+    await service.selectWorktree(external);
+    fs.rmSync(external, { recursive: true, force: true });
+    fs.mkdirSync(external, { recursive: true });
+    git(external, 'init', '-b', 'unrelated');
+    assert.equal(await service.isLinkedWorktreeRoot(external), false);
+    await assert.rejects(service.getCurrentBranch(), /no longer linked/);
+    assert.equal(service.getSelectedWorktreeRoot(), repository);
+    await assert.rejects(service.getChangedFiles(externalPlan), /no longer linked/);
+    await service.checkoutBranch('main');
+    assert.equal(git(external, 'branch', '--show-current'), 'unrelated');
+    assert.equal(
+        await service.getFileContent(parsedOldUri.document, parsedOldUri.filePath),
+        ''
+    );
+
+    const reactivatedService = new GitService({ subscriptions: [] });
+    assert.equal(reactivatedService.getSelectedWorktreeRoot(), repository);
+});
+
+test('overlapping worktree selections keep the latest requested checkout', async () => {
+    const local = temporaryDirectory('offline-review-selection-local-');
+    const firstRoot = temporaryDirectory('offline-review-selection-first-');
+    const latestRoot = temporaryDirectory('offline-review-selection-latest-');
+    installVscodeMock(local);
+
+    const { GitService } = built('git/gitService');
+    const service = new GitService({ subscriptions: [] });
+    const info = root => ({
+        root,
+        headCommit: 'a'.repeat(40),
+        branch: path.basename(root),
+        detached: false,
+        isLocal: root === local,
+    });
+    const worktrees = [info(local), info(firstRoot), info(latestRoot)];
+    let releaseFirst;
+    let firstListStarted;
+    const firstStarted = new Promise(resolve => { firstListStarted = resolve; });
+    const firstCanFinish = new Promise(resolve => { releaseFirst = resolve; });
+    let listCalls = 0;
+    service.listWorktrees = async () => {
+        listCalls++;
+        if (listCalls === 1) {
+            firstListStarted();
+            await firstCanFinish;
+        }
+        return worktrees;
+    };
+    service.validateLinkedWorktreeRoot = async () => true;
+
+    const firstSelection = service.selectWorktree(firstRoot);
+    await firstStarted;
+    const latestSelection = service.selectWorktree(latestRoot);
+    await latestSelection;
+    releaseFirst();
+    await firstSelection;
+
+    assert.equal(service.getSelectedWorktreeRoot(), latestRoot);
+});
+
 test('concurrent review creation is deduplicated per discriminated identity', async () => {
     const workspace = temporaryDirectory('offline-review-creation-');
     installVscodeMock(workspace);
@@ -345,6 +508,7 @@ test('a superseded changed-files refresh cannot overwrite the latest review stat
     const planFor = review => ({
         kind: 'branch',
         reviewId: review.id,
+        worktreeRoot: '/tmp/offline-review-provider-test',
         baseBranch: review.baseBranch,
         targetBranch: review.targetBranch,
         baseCommit: 'a'.repeat(40),
@@ -403,26 +567,27 @@ test('worktree URIs carry prepared identity and file refresh invalidates every m
     const planA = '99999999-9999-4999-8999-999999999999';
     const planB = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
     const planC = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const worktreeRoot = '/tmp/offline-review-uri-test';
     const uriA = getDiffDocumentUri(
-        { kind: 'worktree', reviewId: reviewA, headCommit: headA, planId: planA },
+        { kind: 'worktree', reviewId: reviewA, headCommit: headA, planId: planA, worktreeRoot },
         'src/file.txt',
         'modified',
         reviewA
     );
     const uriB = getDiffDocumentUri(
-        { kind: 'worktree', reviewId: reviewB, headCommit: headA, planId: planB },
+        { kind: 'worktree', reviewId: reviewB, headCommit: headA, planId: planB, worktreeRoot },
         'src/file.txt',
         'modified',
         reviewB
     );
     const uriNewHead = getDiffDocumentUri(
-        { kind: 'worktree', reviewId: reviewA, headCommit: headB, planId: planC },
+        { kind: 'worktree', reviewId: reviewA, headCommit: headB, planId: planC, worktreeRoot },
         'src/file.txt',
         'modified',
         reviewA
     );
     const uriNewPlan = getDiffDocumentUri(
-        { kind: 'worktree', reviewId: reviewA, headCommit: headA, planId: planB },
+        { kind: 'worktree', reviewId: reviewA, headCommit: headA, planId: planB, worktreeRoot },
         'src/file.txt',
         'modified',
         reviewA
@@ -434,16 +599,18 @@ test('worktree URIs carry prepared identity and file refresh invalidates every m
         filePath: 'src/file.txt',
         side: 'modified',
         reviewId: reviewA,
+        worktreeRoot,
         document: {
             kind: 'worktree',
             reviewId: reviewA,
             headCommit: headA,
             planId: planA,
+            worktreeRoot,
         },
     });
 
     const otherFile = getDiffDocumentUri(
-        { kind: 'worktree', reviewId: reviewA, headCommit: headA, planId: planA },
+        { kind: 'worktree', reviewId: reviewA, headCommit: headA, planId: planA, worktreeRoot },
         'src/other.txt',
         'modified',
         reviewA
@@ -458,8 +625,8 @@ test('worktree URIs carry prepared identity and file refresh invalidates every m
         .map(uri => ({ uri }));
     const contentCalls = [];
     const provider = new GitFileContentProvider({
-        async getFileContent(ref, filePath) {
-            contentCalls.push([ref, filePath]);
+        async getFileContent(document, filePath) {
+            contentCalls.push([document, filePath]);
             return 'content';
         },
     });
@@ -480,9 +647,89 @@ test('worktree URIs carry prepared identity and file refresh invalidates every m
     assert.equal(await provider.provideTextDocumentContent(malformed), '');
     assert.deepEqual(contentCalls, []);
     assert.equal(await provider.provideTextDocumentContent(uriA), 'content');
-    assert.deepEqual(contentCalls, [['WORKTREE', 'src/file.txt']]);
+    assert.deepEqual(contentCalls, [[{
+        kind: 'worktree',
+        reviewId: reviewA,
+        headCommit: headA,
+        planId: planA,
+        worktreeRoot,
+    }, 'src/file.txt']]);
     disposable.dispose();
     provider.dispose();
+});
+
+test('same-HEAD worktree comments remain attached after a document-cache refresh', async () => {
+    const workspace = temporaryDirectory('offline-review-worktree-comments-');
+    installVscodeMock(workspace);
+    const head = 'a'.repeat(40);
+    const firstPlanId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    const secondPlanId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+    const { LocalPrManager } = built('services/localPrManager');
+    const { StorageService } = built('storage/storageService');
+    const { ReviewCommentController } = built('comments/commentController');
+    const { getDiffDocumentUri, getFileDiffUris } = built('git/gitService');
+    const { ChangedFilesProvider } = built('views/changedFilesProvider');
+    const manager = new LocalPrManager({
+        async getCommitHash() { return head; },
+    }, workspace);
+    const review = await manager.createUncommittedReview('feature', false);
+    manager.setActiveReview(review.id);
+    const storage = new StorageService(manager);
+    const controller = new ReviewCommentController(storage);
+    const plan = planId => ({
+        kind: 'worktree',
+        reviewId: review.id,
+        worktreeRoot: workspace,
+        branch: 'feature',
+        headCommit: head,
+        planId,
+        left: { kind: 'git', ref: head },
+        right: {
+            kind: 'worktree',
+            reviewId: review.id,
+            headCommit: head,
+            planId,
+            worktreeRoot: workspace,
+        },
+    });
+    const firstPlan = plan(firstPlanId);
+    controller.setReviewableFiles(['dirty.txt']);
+    controller.loadAllThreads(firstPlan);
+    const firstUri = getDiffDocumentUri(
+        firstPlan.right,
+        'dirty.txt',
+        'modified',
+        review.id,
+        workspace
+    );
+    controller.createThread(
+        firstUri,
+        new vscode.Range(0, 0, 0, 0),
+        'survives refresh',
+        'dirty.txt'
+    );
+
+    const secondPlan = plan(secondPlanId);
+    const threadCountBefore = vscode.__createdCommentThreads.length;
+    controller.loadAllThreads(secondPlan);
+    const refreshedThread = vscode.__createdCommentThreads.at(-1);
+    assert.equal(vscode.__createdCommentThreads.length, threadCountBefore + 1);
+    assert.equal(new URLSearchParams(refreshedThread.uri.query).get('planId'), secondPlanId);
+
+    const provider = new ChangedFilesProvider({
+        async getChangedFiles() {
+            return [{ status: 'modified', filePath: 'dirty.txt' }];
+        },
+        async getCommitsForDiff() { return []; },
+        getFileDiffUris,
+    }, storage, manager);
+    assert.equal(await provider.refresh(secondPlan), true);
+    provider.getChildren();
+    assert.equal(provider.getAllFileItems()[0].commentCount, 1);
+
+    provider.dispose();
+    controller.dispose();
+    manager.dispose();
 });
 
 test('comment mutations stay in their owning UUID bucket and branch threads remain pinned', async () => {
@@ -516,6 +763,7 @@ test('comment mutations stay in their owning UUID bucket and branch threads rema
     const plan = (review, targetCommit) => ({
         kind: 'branch',
         reviewId: review.id,
+        worktreeRoot: workspace,
         baseBranch: review.baseBranch,
         targetBranch: review.targetBranch,
         baseCommit,
@@ -529,7 +777,13 @@ test('comment mutations stay in their owning UUID bucket and branch threads rema
     const controller = new ReviewCommentController(storage);
     controller.setReviewableFiles(['old.txt']);
     controller.loadAllThreads(planA);
-    const uriA = getDiffDocumentUri(planA.right, 'old.txt', 'modified', reviewA.id);
+    const uriA = getDiffDocumentUri(
+        planA.right,
+        'old.txt',
+        'modified',
+        reviewA.id,
+        planA.worktreeRoot
+    );
     const range = new vscode.Range(4, 0, 4, 0);
     const pendingReviewId = controller.captureNewThreadReviewId(uriA, 'old.txt');
     controller.createThread(uriA, range, 'owned by A', 'old.txt');
@@ -605,7 +859,8 @@ test('comment mutations stay in their owning UUID bucket and branch threads rema
         refreshedPlan.right,
         'renamed.txt',
         'modified',
-        reviewA.id
+        reviewA.id,
+        refreshedPlan.worktreeRoot
     );
     controller.loadThreadsForFile(currentUri, 'renamed.txt', refreshedPlan);
     assert.equal(vscode.__createdCommentThreads.length, beforePinnedLoad + 1);

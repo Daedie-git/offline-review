@@ -12,6 +12,7 @@ import {
     FileChangeStatus,
     GitApi,
     GitRepository,
+    GitWorktreeInfo,
     LocalPr,
     WorktreeDiffDocument,
     WorktreeDiffPlan,
@@ -36,6 +37,8 @@ export interface ParsedDiffDocumentUri {
     readonly filePath: string;
     readonly side: 'original' | 'modified' | undefined;
     readonly reviewId: string | undefined;
+    /** Captured checkout used for modified-side language forwarding. */
+    readonly worktreeRoot: string | undefined;
     readonly document: DiffDocument;
 }
 
@@ -44,11 +47,18 @@ export function getDiffDocumentUri(
     document: DiffDocument,
     filePath: string,
     side?: 'original' | 'modified',
-    reviewId?: string
+    reviewId?: string,
+    capturedWorktreeRoot?: string
 ): vscode.Uri {
     const query = new URLSearchParams({
         ref: document.kind === 'worktree' ? GitService.WORKTREE_REF : document.ref,
     });
+    const worktreeRoot = document.kind === 'worktree'
+        ? document.worktreeRoot
+        : capturedWorktreeRoot;
+    if (worktreeRoot) {
+        query.set('worktreeRoot', normalizeRoot(worktreeRoot));
+    }
     if (side) {
         query.set('side', side);
     }
@@ -75,7 +85,7 @@ export function parseDiffDocumentUri(uri: vscode.Uri): ParsedDiffDocumentUri | u
         return undefined;
     }
     const filePath = uri.path.startsWith('/') ? uri.path.slice(1) : uri.path;
-    if (!filePath) {
+    if (!isSafeRelativeGitPath(filePath)) {
         return undefined;
     }
 
@@ -87,20 +97,34 @@ export function parseDiffDocumentUri(uri: vscode.Uri): ParsedDiffDocumentUri | u
     }
     const side = sideValue ?? undefined;
     const reviewId = query.get('reviewId') ?? undefined;
+    const rootValue = query.get('worktreeRoot');
+    const worktreeRoot = rootValue && isAbsoluteNormalizedRoot(rootValue)
+        ? rootValue
+        : undefined;
+    if (rootValue && !worktreeRoot) {
+        return undefined;
+    }
 
     if (ref === GitService.WORKTREE_REF) {
         const headCommit = query.get('head');
         const planId = query.get('planId');
         if (side !== 'modified' || !reviewId || !isUuid(reviewId)
             || !headCommit || !isFullObjectId(headCommit)
-            || !planId || !isUuid(planId)) {
+            || !planId || !isUuid(planId) || !worktreeRoot) {
             return undefined;
         }
         return {
             filePath,
             side,
             reviewId,
-            document: { kind: 'worktree', reviewId, headCommit, planId },
+            worktreeRoot,
+            document: {
+                kind: 'worktree',
+                reviewId,
+                headCommit,
+                planId,
+                worktreeRoot,
+            },
         };
     }
 
@@ -111,6 +135,7 @@ export function parseDiffDocumentUri(uri: vscode.Uri): ParsedDiffDocumentUri | u
         filePath,
         side,
         reviewId,
+        worktreeRoot,
         document: { kind: 'git', ref },
     };
 }
@@ -120,8 +145,20 @@ export function getFileDiffUris(plan: DiffPlan, change: FileChange): FileDiffUri
         ? change.oldFilePath
         : change.filePath;
     return Object.freeze({
-        left: getDiffDocumentUri(plan.left, leftPath, 'original', plan.reviewId),
-        right: getDiffDocumentUri(plan.right, change.filePath, 'modified', plan.reviewId),
+        left: getDiffDocumentUri(
+            plan.left,
+            leftPath,
+            'original',
+            plan.reviewId,
+            plan.worktreeRoot
+        ),
+        right: getDiffDocumentUri(
+            plan.right,
+            change.filePath,
+            'modified',
+            plan.reviewId,
+            plan.worktreeRoot
+        ),
     });
 }
 
@@ -129,7 +166,17 @@ export class GitService {
     static readonly WORKTREE_REF = 'WORKTREE';
 
     private repo: GitRepository | undefined;
-    private readonly workspaceRoot: string;
+    /** Original workspace location; storage and repository discovery stay here. */
+    private readonly localWorkspaceRoot: string;
+    /** Repository top-level for the checkout containing the workspace. */
+    private localWorktreeRoot: string;
+    /** Session-only review context, reset to Local on each activation. */
+    private selectedWorktreeRoot: string;
+    /** Last-request-wins guard for overlapping webview selection messages. */
+    private worktreeSelectionGeneration = 0;
+
+    private readonly _onDidChangeWorktreeSelection = new vscode.EventEmitter<GitWorktreeInfo>();
+    readonly onDidChangeWorktreeSelection = this._onDidChangeWorktreeSelection.event;
 
     /** Compatibility event for named-branch checkouts. */
     private readonly _onDidChangeBranch = new vscode.EventEmitter<string>();
@@ -142,7 +189,12 @@ export class GitService {
     private _lastCommit: string | undefined;
 
     constructor(private readonly context: vscode.ExtensionContext) {
-        this.workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+        this.localWorkspaceRoot = normalizeRoot(
+            vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? ''
+        );
+        this.localWorktreeRoot = this.localWorkspaceRoot;
+        this.selectedWorktreeRoot = this.localWorkspaceRoot;
+        this.context.subscriptions.push(this._onDidChangeWorktreeSelection);
     }
 
     async initialize(): Promise<boolean> {
@@ -157,8 +209,17 @@ export class GitService {
         }
 
         const api = gitExtension.exports.getAPI(1) as GitApi;
-        if (api.repositories.length > 0) {
-            this.repo = api.repositories[0];
+        try {
+            await this.initializeLocalWorktreeRoot();
+        } catch {
+            return false;
+        }
+
+        const matchingRepository = api.repositories.find(repo =>
+            sameRoot(repo.rootUri.fsPath, this.localWorktreeRoot)
+        );
+        if (matchingRepository) {
+            this.repo = matchingRepository;
             this.trackBranchChanges();
             return true;
         }
@@ -170,6 +231,9 @@ export class GitService {
             }, 10_000);
 
             const disposable = api.onDidOpenRepository((repo: GitRepository) => {
+                if (!sameRoot(repo.rootUri.fsPath, this.localWorktreeRoot)) {
+                    return;
+                }
                 clearTimeout(timeout);
                 disposable.dispose();
                 this.repo = repo;
@@ -177,6 +241,19 @@ export class GitService {
                 resolve(true);
             });
         });
+    }
+
+    private async initializeLocalWorktreeRoot(): Promise<void> {
+        const root = (await this.execGit(
+            ['rev-parse', '--show-toplevel'],
+            DEFAULT_GIT_TIMEOUT,
+            this.localWorkspaceRoot
+        )).trim();
+        if (!root || !path.isAbsolute(root)) {
+            throw new Error('Git did not return the local worktree root');
+        }
+        this.localWorktreeRoot = normalizeRoot(root);
+        this.selectedWorktreeRoot = this.localWorktreeRoot;
     }
 
     private trackBranchChanges(): void {
@@ -205,6 +282,139 @@ export class GitService {
         this.context.subscriptions.push(disposable);
     }
 
+    getLocalWorkspaceRoot(): string {
+        return this.localWorkspaceRoot;
+    }
+
+    getSelectedWorktreeRoot(): string {
+        return this.selectedWorktreeRoot;
+    }
+
+    isLocalWorktreeSelected(): boolean {
+        return sameRoot(this.selectedWorktreeRoot, this.localWorktreeRoot);
+    }
+
+    /** Always discover linked worktrees from the original workspace checkout. */
+    async listWorktrees(): Promise<GitWorktreeInfo[]> {
+        const output = await this.execGit(
+            ['worktree', 'list', '--porcelain', '-z'],
+            DEFAULT_GIT_TIMEOUT,
+            this.localWorkspaceRoot
+        );
+        return parseWorktreeList(output, this.localWorktreeRoot);
+    }
+
+    /** Select one currently linked and accessible checkout for this session. */
+    async selectWorktree(root: string): Promise<GitWorktreeInfo> {
+        const generation = ++this.worktreeSelectionGeneration;
+        const normalized = normalizeRoot(root);
+        const worktrees = await this.listWorktrees();
+        const currentSelection = (): GitWorktreeInfo | undefined => worktrees.find(candidate =>
+            sameRoot(candidate.root, this.selectedWorktreeRoot)
+        );
+        const selected = worktrees.find(candidate => sameRoot(candidate.root, normalized));
+        if (!selected) {
+            const current = currentSelection();
+            if (generation !== this.worktreeSelectionGeneration && current) {
+                return current;
+            }
+            throw new Error(`The selected Git worktree is no longer linked: ${root}`);
+        }
+        if (!await this.validateLinkedWorktreeRoot(selected.root)) {
+            const current = currentSelection();
+            if (generation !== this.worktreeSelectionGeneration && current) {
+                return current;
+            }
+            throw new Error(`The selected Git worktree is no longer available: ${selected.root}`);
+        }
+
+        // A slower, older request must not overwrite the user's latest choice.
+        if (generation !== this.worktreeSelectionGeneration) {
+            return currentSelection() ?? selected;
+        }
+
+        if (!sameRoot(this.selectedWorktreeRoot, selected.root)) {
+            this.selectedWorktreeRoot = selected.root;
+            this._onDidChangeWorktreeSelection.fire(selected);
+        }
+        return selected;
+    }
+
+    /** Validate an identity embedded in a virtual URI without trusting its path. */
+    async isLinkedWorktreeRoot(root: string): Promise<boolean> {
+        if (!isAbsoluteNormalizedRoot(root)) {
+            return false;
+        }
+        try {
+            const worktrees = await this.listWorktrees();
+            const linked = worktrees.find(candidate => sameRoot(candidate.root, root));
+            return Boolean(linked) && await this.validateLinkedWorktreeRoot(root);
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Revalidate both the filesystem entry and common Git directory. A stale
+     * worktree-list path must never authorize an unrelated repository or symlink.
+     */
+    private async validateLinkedWorktreeRoot(root: string): Promise<boolean> {
+        try {
+            const stat = await fs.promises.lstat(root);
+            if (!stat.isDirectory() || stat.isSymbolicLink()) {
+                return false;
+            }
+            const inside = (await this.execGit(
+                ['rev-parse', '--is-inside-work-tree'],
+                DEFAULT_GIT_TIMEOUT,
+                root
+            )).trim();
+            if (inside !== 'true') {
+                return false;
+            }
+            const [candidateCommonDir, localCommonDir] = await Promise.all([
+                this.getCommonGitDir(root),
+                this.getCommonGitDir(this.localWorkspaceRoot),
+            ]);
+            return sameRoot(candidateCommonDir, localCommonDir);
+        } catch {
+            return false;
+        }
+    }
+
+    private async getCommonGitDir(root: string): Promise<string> {
+        const commonDir = (await this.execGit(
+            ['rev-parse', '--path-format=absolute', '--git-common-dir'],
+            DEFAULT_GIT_TIMEOUT,
+            root
+        )).trim();
+        if (!commonDir || !path.isAbsolute(commonDir)) {
+            throw new Error('Git did not return an absolute common directory');
+        }
+        return normalizeRoot(await fs.promises.realpath(commonDir));
+    }
+
+    private async requireLinkedWorktreeRoot(root: string): Promise<void> {
+        if (await this.isLinkedWorktreeRoot(root)) {
+            return;
+        }
+
+        // Fail closed, and return the live selector to Local when an external
+        // checkout disappears or is replaced while the extension is running.
+        if (sameRoot(root, this.selectedWorktreeRoot)
+            && !sameRoot(root, this.localWorktreeRoot)
+            && await this.isLinkedWorktreeRoot(this.localWorktreeRoot)) {
+            const worktrees = await this.listWorktrees();
+            const local = worktrees.find(candidate => candidate.isLocal);
+            if (local) {
+                this.worktreeSelectionGeneration++;
+                this.selectedWorktreeRoot = local.root;
+                this._onDidChangeWorktreeSelection.fire(local);
+            }
+        }
+        throw new Error(`Git worktree is no longer linked to this repository: ${root}`);
+    }
+
     async getBranches(includeRemote: boolean = false): Promise<string[]> {
         if (!this.repo) {
             return [];
@@ -231,7 +441,27 @@ export class GitService {
     }
 
     async getCurrentBranch(): Promise<string | undefined> {
-        return this.repo?.state.HEAD?.name;
+        const root = this.selectedWorktreeRoot;
+        return this.getCurrentBranchAt(root);
+    }
+
+    private async getCurrentBranchAt(
+        root: string,
+        alreadyValidated: boolean = false
+    ): Promise<string | undefined> {
+        if (!alreadyValidated) {
+            await this.requireLinkedWorktreeRoot(root);
+        }
+        try {
+            const branch = (await this.execGit(
+                ['symbolic-ref', '--quiet', '--short', 'HEAD'],
+                DEFAULT_GIT_TIMEOUT,
+                root
+            )).trim();
+            return branch || undefined;
+        } catch {
+            return undefined;
+        }
     }
 
     /** Detect the primary branch from remote metadata without guessing names. */
@@ -330,24 +560,38 @@ export class GitService {
         if (!branch) {
             throw new Error('Cannot switch to an empty branch name');
         }
-        await this.execGit(['checkout', branch]);
+        const worktreeRoot = this.selectedWorktreeRoot;
+        await this.requireLinkedWorktreeRoot(worktreeRoot);
+        await this.execGit(['checkout', branch], DEFAULT_GIT_TIMEOUT, worktreeRoot);
     }
 
     /** Resolve a persisted review into one explicit, immutable diff strategy. */
     async prepareDiffPlan(review: LocalPr): Promise<DiffPlan> {
+        // Capture before the first await so a concurrent selector change cannot
+        // mix Git commands or document identities from two linked checkouts.
+        const worktreeRoot = this.selectedWorktreeRoot;
+        await this.requireLinkedWorktreeRoot(worktreeRoot);
         if (review.mode === 'branch') {
             // Resolve branch names on every refresh so newly-created commits are
             // included, then freeze this refresh to immutable object IDs. Saved
             // commits remain a fallback for reviews whose branches were deleted.
             const [baseCommit, targetCommit] = await Promise.all([
-                this.resolveCommitWithFallback(review.baseBranch, review.sourceCommit),
-                this.resolveCommitWithFallback(review.targetBranch, review.targetCommit),
+                this.resolveCommitWithFallback(
+                    review.baseBranch,
+                    review.sourceCommit,
+                    worktreeRoot
+                ),
+                this.resolveCommitWithFallback(
+                    review.targetBranch,
+                    review.targetCommit,
+                    worktreeRoot
+                ),
             ]);
             const mergeBaseCommit = (await this.execGit([
                 'merge-base',
                 baseCommit,
                 targetCommit,
-            ])).trim();
+            ], DEFAULT_GIT_TIMEOUT, worktreeRoot)).trim();
             if (!isFullObjectId(mergeBaseCommit)) {
                 throw new Error('Git did not return an immutable merge-base commit');
             }
@@ -357,6 +601,7 @@ export class GitService {
             return Object.freeze<BranchDiffPlan>({
                 kind: 'branch',
                 reviewId: review.id,
+                worktreeRoot,
                 baseBranch: review.baseBranch,
                 targetBranch: review.targetBranch,
                 baseCommit,
@@ -367,7 +612,7 @@ export class GitService {
             });
         }
 
-        const currentBranch = await this.getCurrentBranch();
+        const currentBranch = await this.getCurrentBranchAt(worktreeRoot, true);
         if (!currentBranch) {
             throw new Error('Cannot review uncommitted changes from detached HEAD');
         }
@@ -377,7 +622,7 @@ export class GitService {
             );
         }
 
-        const headCommit = await this.resolveCommit('HEAD');
+        const headCommit = await this.resolveCommit('HEAD', worktreeRoot);
         const planId = crypto.randomUUID();
         const left = Object.freeze({ kind: 'git' as const, ref: headCommit });
         const right = Object.freeze<WorktreeDiffDocument>({
@@ -385,10 +630,12 @@ export class GitService {
             reviewId: review.id,
             headCommit,
             planId,
+            worktreeRoot,
         });
         return Object.freeze<WorktreeDiffPlan>({
             kind: 'worktree',
             reviewId: review.id,
+            worktreeRoot,
             branch: review.branch,
             headCommit,
             planId,
@@ -399,6 +646,7 @@ export class GitService {
 
     async getChangedFiles(plan: DiffPlan): Promise<FileChange[]> {
         this.assertValidPlan(plan);
+        await this.requireLinkedWorktreeRoot(plan.worktreeRoot);
         const output = plan.kind === 'branch'
             ? await this.execGit([
                 'diff',
@@ -409,7 +657,7 @@ export class GitService {
                 plan.mergeBaseCommit,
                 plan.targetCommit,
                 '--',
-            ])
+            ], DEFAULT_GIT_TIMEOUT, plan.worktreeRoot)
             : await this.execGit([
                 'diff',
                 '--no-ext-diff',
@@ -418,7 +666,7 @@ export class GitService {
                 '--find-renames',
                 plan.headCommit,
                 '--',
-            ]);
+            ], DEFAULT_GIT_TIMEOUT, plan.worktreeRoot);
 
         const files = parseNameStatus(output);
         if (plan.kind === 'worktree') {
@@ -428,7 +676,7 @@ export class GitService {
                 '--exclude-standard',
                 '-z',
                 '--',
-            ]);
+            ], DEFAULT_GIT_TIMEOUT, plan.worktreeRoot);
             const seen = new Set(files.map(file => file.filePath));
             for (const filePath of splitNul(untrackedOutput)) {
                 if (!seen.has(filePath)) {
@@ -454,16 +702,25 @@ export class GitService {
         return getFileDiffUris(plan, change);
     }
 
-    async getFileContent(ref: string, filePath: string): Promise<string> {
-        if (ref === GitService.WORKTREE_REF) {
-            return this.getWorkingTreeFileContent(filePath);
+    async getFileContent(document: DiffDocument, filePath: string): Promise<string> {
+        if (!isSafeRelativeGitPath(filePath)) {
+            return '';
         }
-        if (!isFullObjectId(ref)) {
+        if (document.kind === 'worktree') {
+            return this.getWorkingTreeFileContent(document.worktreeRoot, filePath);
+        }
+        if (!isFullObjectId(document.ref)) {
             return '';
         }
 
         try {
-            return await this.execGit(['cat-file', 'blob', `${ref}:${filePath}`]);
+            // Linked worktrees share object storage. Reading immutable objects
+            // from Local avoids trusting a root supplied by a virtual URI.
+            return await this.execGit(
+                ['cat-file', 'blob', `${document.ref}:${filePath}`],
+                DEFAULT_GIT_TIMEOUT,
+                this.localWorkspaceRoot
+            );
         } catch {
             return '';
         }
@@ -473,11 +730,20 @@ export class GitService {
         if (plan.kind === 'worktree') {
             return [];
         }
-        return this.getCommitsBetween(plan.mergeBaseCommit, plan.targetCommit);
+        await this.requireLinkedWorktreeRoot(plan.worktreeRoot);
+        return this.getCommitsBetween(
+            plan.mergeBaseCommit,
+            plan.targetCommit,
+            plan.worktreeRoot
+        );
     }
 
     /** Both arguments must be immutable commit hashes. */
-    async getCommitsBetween(sourceCommit: string, targetCommit: string): Promise<CommitInfo[]> {
+    async getCommitsBetween(
+        sourceCommit: string,
+        targetCommit: string,
+        worktreeRoot: string = this.selectedWorktreeRoot
+    ): Promise<CommitInfo[]> {
         assertFullObjectId(sourceCommit, 'source commit');
         assertFullObjectId(targetCommit, 'target commit');
         const fieldSeparator = '\u001f';
@@ -497,7 +763,7 @@ export class GitService {
                 `--format=${format}`,
                 `${sourceCommit}..${targetCommit}`,
                 '--',
-            ]);
+            ], DEFAULT_GIT_TIMEOUT, worktreeRoot);
             return output
                 .split(recordSeparator)
                 .map(record => record.replace(/^\n+|\n+$/g, ''))
@@ -511,18 +777,25 @@ export class GitService {
         }
     }
 
-    private async resolveCommitWithFallback(ref: string, fallbackCommit: string): Promise<string> {
+    private async resolveCommitWithFallback(
+        ref: string,
+        fallbackCommit: string,
+        worktreeRoot: string
+    ): Promise<string> {
         try {
-            return await this.resolveCommit(ref);
+            return await this.resolveCommit(ref, worktreeRoot);
         } catch (error) {
             if (!fallbackCommit) {
                 throw error;
             }
-            return this.resolveCommit(fallbackCommit);
+            return this.resolveCommit(fallbackCommit, worktreeRoot);
         }
     }
 
-    private async resolveCommit(ref: string): Promise<string> {
+    private async resolveCommit(
+        ref: string,
+        worktreeRoot: string = this.selectedWorktreeRoot
+    ): Promise<string> {
         if (!ref) {
             throw new Error('Cannot resolve an empty Git ref');
         }
@@ -531,18 +804,34 @@ export class GitService {
             '--verify',
             '--end-of-options',
             `${ref}^{commit}`,
-        ])).trim();
+        ], DEFAULT_GIT_TIMEOUT, worktreeRoot)).trim();
         if (!isFullObjectId(resolved)) {
             throw new Error(`Git ref "${ref}" did not resolve to a full commit hash`);
         }
         return resolved;
     }
 
-    private async getWorkingTreeFileContent(filePath: string): Promise<string> {
+    private async getWorkingTreeFileContent(
+        worktreeRoot: string,
+        filePath: string
+    ): Promise<string> {
         try {
-            const root = path.resolve(this.workspaceRoot);
+            if (!await this.isLinkedWorktreeRoot(worktreeRoot)) {
+                return '';
+            }
+            const root = normalizeRoot(worktreeRoot);
             const absolutePath = path.resolve(root, filePath);
-            if (!filePath || (absolutePath !== root && !absolutePath.startsWith(`${root}${path.sep}`))) {
+            if (!isPathInside(root, absolutePath)) {
+                return '';
+            }
+
+            // Resolve the parent to prevent an untracked symlinked directory
+            // from turning a forged virtual URI into an arbitrary file read.
+            const [realRoot, realParent] = await Promise.all([
+                fs.promises.realpath(root),
+                fs.promises.realpath(path.dirname(absolutePath)),
+            ]);
+            if (!isPathInside(realRoot, realParent, true)) {
                 return '';
             }
 
@@ -553,13 +842,20 @@ export class GitService {
             if (!stat.isFile()) {
                 return '';
             }
-            return await fs.promises.readFile(absolutePath, 'utf8');
+            const realFile = await fs.promises.realpath(absolutePath);
+            if (!isPathInside(realRoot, realFile)) {
+                return '';
+            }
+            return await fs.promises.readFile(realFile, 'utf8');
         } catch {
             return '';
         }
     }
 
     private assertValidPlan(plan: DiffPlan): void {
+        if (!isAbsoluteNormalizedRoot(plan.worktreeRoot)) {
+            throw new Error('DiffPlan worktree root is not an absolute normalized path');
+        }
         if (plan.kind === 'branch') {
             assertFullObjectId(plan.baseCommit, 'base commit');
             assertFullObjectId(plan.mergeBaseCommit, 'merge-base commit');
@@ -576,19 +872,24 @@ export class GitService {
             || plan.right.reviewId !== plan.reviewId
             || plan.right.headCommit !== plan.headCommit
             || plan.right.planId !== plan.planId
+            || !sameRoot(plan.right.worktreeRoot, plan.worktreeRoot)
             || !isUuid(plan.planId)) {
             throw new Error('Worktree DiffPlan document refs do not match its strategy');
         }
     }
 
-    private execGit(args: readonly string[], timeout: number = DEFAULT_GIT_TIMEOUT): Promise<string> {
-        if (!this.workspaceRoot) {
+    private execGit(
+        args: readonly string[],
+        timeout: number = DEFAULT_GIT_TIMEOUT,
+        worktreeRoot: string = this.selectedWorktreeRoot
+    ): Promise<string> {
+        if (!worktreeRoot) {
             return Promise.reject(new Error('No workspace folder is open'));
         }
 
         return new Promise<string>((resolve, reject) => {
             cp.execFile('git', [...args], {
-                cwd: this.workspaceRoot,
+                cwd: worktreeRoot,
                 encoding: 'utf8',
                 maxBuffer: MAX_GIT_OUTPUT,
                 timeout,
@@ -602,6 +903,76 @@ export class GitService {
             });
         });
     }
+}
+
+/** Parse NUL-delimited porcelain without treating spaces or newlines as separators. */
+export function parseWorktreeList(
+    output: string,
+    localWorktreeRoot: string
+): GitWorktreeInfo[] {
+    const records: string[][] = [];
+    let record: string[] = [];
+    for (const token of output.split('\0')) {
+        if (token === '') {
+            if (record.length > 0) {
+                records.push(record);
+                record = [];
+            }
+        } else {
+            record.push(token);
+        }
+    }
+    if (record.length > 0) {
+        records.push(record);
+    }
+
+    const localRoot = normalizeRoot(localWorktreeRoot);
+    const worktrees: GitWorktreeInfo[] = [];
+    for (const fields of records) {
+        let root: string | undefined;
+        let headCommit: string | undefined;
+        let branch: string | undefined;
+        let detached = false;
+        let unavailable = false;
+        for (const field of fields) {
+            const separator = field.indexOf(' ');
+            const key = separator === -1 ? field : field.slice(0, separator);
+            const value = separator === -1 ? '' : field.slice(separator + 1);
+            switch (key) {
+                case 'worktree':
+                    root = value;
+                    break;
+                case 'HEAD':
+                    headCommit = value;
+                    break;
+                case 'branch':
+                    branch = value.startsWith('refs/heads/')
+                        ? value.slice('refs/heads/'.length)
+                        : value;
+                    break;
+                case 'detached':
+                    detached = true;
+                    break;
+                case 'bare':
+                case 'prunable':
+                    unavailable = true;
+                    break;
+            }
+        }
+        if (unavailable || !root || !path.isAbsolute(root)
+            || !headCommit || !isFullObjectId(headCommit)) {
+            continue;
+        }
+        const normalizedRoot = normalizeRoot(root);
+        worktrees.push(Object.freeze({
+            root: normalizedRoot,
+            headCommit,
+            branch: detached ? undefined : branch,
+            detached: detached || !branch,
+            isLocal: sameRoot(normalizedRoot, localRoot),
+        }));
+    }
+    return worktrees;
 }
 
 function parseNameStatus(output: string): FileChange[] {
@@ -649,6 +1020,45 @@ function splitNul(output: string): string[] {
 
 function splitLines(output: string): string[] {
     return output.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+}
+
+function normalizeRoot(root: string): string {
+    return root ? path.resolve(root) : '';
+}
+
+function sameRoot(left: string, right: string): boolean {
+    const normalizedLeft = normalizeRoot(left);
+    const normalizedRight = normalizeRoot(right);
+    return process.platform === 'win32'
+        ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+        : normalizedLeft === normalizedRight;
+}
+
+function isAbsoluteNormalizedRoot(root: string): boolean {
+    if (!root || root.includes('\0') || !path.isAbsolute(root)) {
+        return false;
+    }
+    const normalized = normalizeRoot(root);
+    return process.platform === 'win32'
+        ? root.toLowerCase() === normalized.toLowerCase()
+        : root === normalized;
+}
+
+function isSafeRelativeGitPath(filePath: string): boolean {
+    if (!filePath || filePath.includes('\0') || path.isAbsolute(filePath)) {
+        return false;
+    }
+    return !filePath.split(/[\\/]/).some(segment => segment === '..' || segment === '');
+}
+
+function isPathInside(root: string, candidate: string, allowEqual: boolean = false): boolean {
+    const relative = path.relative(root, candidate);
+    if (relative === '') {
+        return allowEqual;
+    }
+    return relative !== '..'
+        && !relative.startsWith(`..${path.sep}`)
+        && !path.isAbsolute(relative);
 }
 
 function isFullObjectId(value: string): boolean {

@@ -41,7 +41,9 @@ Install directly from the [VS Code Marketplace](https://marketplace.visualstudio
 
 ## Features
 
-- **Branch Diff View** - Select base and compare branches, see all changed files
+- **Linked Worktree Review** - Select any linked Git worktree without changing the open VS Code workspace
+- **Two Review Modes** - Review the selected worktree's uncommitted changes or its active branch against a base
+- **Branch Diff View** - Select a base branch and see all changed files on the active branch
 - **Inline Comments** - Add, edit, delete comments on any line in the diff
 - **Resolve/Unresolve** - Toggle comment threads as resolved with a single click
 - **Tree Grouping** - Files grouped by directory with file count
@@ -65,15 +67,18 @@ Offline Review comments are stored offline, making Copilot queries **36x faster*
 
 1. Open a Git repository in VS Code
 2. Click the **Offline Review** icon in the activity bar
-3. Select a **Base** branch and a **Compare** branch
-4. Browse changed files, open diffs, and add comments
+3. Choose a linked **Git worktree** (the workspace checkout is **Local** and is selected by default on every activation)
+4. Choose **Uncommitted** for that worktree's `HEAD` vs files, or **Active branch** for its checked-out branch vs the selected base
+5. Browse changed files, open diffs, and add comments
+
+Worktree selection is session-only: Offline Review never switches or opens a VS Code workspace and does not persist the selection. Review metadata and comments remain centralized under the original workspace's `.vscode/local-reviews/` directory.
 
 ## Architecture
 
 ```
 User
  ├── Activity Bar (Offline Review sidebar)
- │    ├── Branch Selector  — pick base & compare branches
+ │    ├── Branch Selector  — pick a linked worktree, review mode, and base branch
  │    ├── Changed Files    — grouped by directory, reviewed checkbox, comment badge
  │    ├── Comments Panel   — all threads & replies
  │    └── Saved Reviews    — switch between review sessions
@@ -84,7 +89,7 @@ Copilot Chat
  └── #offlineReviewComments  — query your review comments via LM Tool
 
 Core Services
- ├── GitService       — branch list, file diffs, commit log
+ ├── GitService       — linked worktree selection, branch list, file diffs, commit log
  ├── CommentController — create, edit, delete, resolve threads
  ├── LocalPrManager   — review CRUD, reviewed-file state
  └── StorageService   — read/write UUID-isolated JSON under .vscode/local-reviews/

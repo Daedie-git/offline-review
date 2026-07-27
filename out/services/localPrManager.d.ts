@@ -34,6 +34,8 @@ export declare class LocalPrManager {
     setActiveReview(id: string): void;
     private activateReview;
     getActiveReview(): LocalPr | undefined;
+    /** Clear only the active pointer; saved reviews and comments remain intact. */
+    deactivateReview(): boolean;
     listReviews(): LocalPr[];
     getReviewById(id: string): LocalPr | undefined;
     findReviewByBranch(branch: string, mode?: ReviewMode): LocalPr | undefined;

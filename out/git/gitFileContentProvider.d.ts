@@ -10,9 +10,9 @@ export declare class GitFileContentProvider implements vscode.TextDocumentConten
     readonly onDidChange: vscode.Event<vscode.Uri>;
     constructor(gitService: GitService);
     provideTextDocumentContent(uri: vscode.Uri): Promise<string>;
-    /** Invalidate every open WORKTREE identity for one real file. */
-    refreshWorkingTreeFile(filePath: string): void;
-    /** Invalidate every open WORKTREE virtual document. */
-    refreshAllWorkingTree(): void;
+    /** Invalidate open identities for one real file in one captured checkout. */
+    refreshWorkingTreeFile(filePath: string, worktreeRoot?: string): void;
+    /** Invalidate open WORKTREE documents, optionally for one checkout only. */
+    refreshAllWorkingTree(worktreeRoot?: string): void;
     dispose(): void;
 }

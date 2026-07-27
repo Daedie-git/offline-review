@@ -1,12 +1,16 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { StorageService } from '../storage/storageService';
+import { GitService } from '../git/gitService';
 
 export class ReviewFileDecorationProvider implements vscode.FileDecorationProvider {
     private _onDidChangeFileDecorations = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>();
     readonly onDidChangeFileDecorations = this._onDidChangeFileDecorations.event;
 
-    constructor(private storageService: StorageService) {}
+    constructor(
+        private readonly storageService: StorageService,
+        private readonly gitService: GitService
+    ) {}
 
     provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
         // Only decorate workspace files (file:// scheme)
@@ -14,12 +18,12 @@ export class ReviewFileDecorationProvider implements vscode.FileDecorationProvid
             return undefined;
         }
 
-        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        if (!workspaceRoot) {
+        const worktreeRoot = this.gitService.getSelectedWorktreeRoot();
+        if (!worktreeRoot) {
             return undefined;
         }
 
-        const relative = path.relative(workspaceRoot, uri.fsPath);
+        const relative = path.relative(worktreeRoot, uri.fsPath);
         if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
             return undefined;
         }

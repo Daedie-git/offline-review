@@ -70,6 +70,19 @@ export interface FileChange {
 
 export type FileChangeStatus = 'added' | 'modified' | 'deleted' | 'renamed';
 
+/** One linked checkout reported by `git worktree list --porcelain -z`. */
+export interface GitWorktreeInfo {
+    /** Absolute root path of the linked checkout. */
+    readonly root: string;
+    /** Immutable commit currently checked out by this worktree. */
+    readonly headCommit: string;
+    /** Short local branch name, absent for detached worktrees. */
+    readonly branch?: string;
+    readonly detached: boolean;
+    /** Whether this is the checkout containing the opened VS Code workspace. */
+    readonly isLocal: boolean;
+}
+
 /** A file snapshot loaded from Git object storage. */
 export interface GitObjectDiffDocument {
     readonly kind: 'git';
@@ -86,12 +99,16 @@ export interface WorktreeDiffDocument {
     readonly headCommit: string;
     /** Stable identity unique to this prepared worktree plan. */
     readonly planId: string;
+    /** Checkout captured by the plan; never inferred from mutable selection. */
+    readonly worktreeRoot: string;
 }
 
 export type DiffDocument = GitObjectDiffDocument | WorktreeDiffDocument;
 
 interface DiffPlanBase {
     readonly reviewId: string;
+    /** Selected linked checkout captured before any asynchronous preparation. */
+    readonly worktreeRoot: string;
     readonly left: GitObjectDiffDocument;
     readonly right: DiffDocument;
 }
@@ -143,6 +160,7 @@ export interface WorktreeThreadTarget {
     readonly kind: 'worktree';
     readonly reviewId: string;
     readonly headCommit: string;
+    /** Plan active when authored; retained for stale-HEAD display compatibility. */
     readonly planId: string;
     readonly filePath: string;
 }
@@ -189,8 +207,7 @@ export function isThreadCurrentForPlan(
         ? target.kind === 'git' && target.ref === plan.targetCommit
         : target.kind === 'worktree'
             && target.reviewId === plan.reviewId
-            && target.headCommit === plan.headCommit
-            && target.planId === plan.planId;
+            && target.headCommit === plan.headCommit;
 }
 
 export interface LocalPrRegistry {

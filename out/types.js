@@ -34,7 +34,6 @@ function isThreadCurrentForPlan(thread, plan, filePath = thread.filePath) {
         ? target.kind === 'git' && target.ref === plan.targetCommit
         : target.kind === 'worktree'
             && target.reviewId === plan.reviewId
-            && target.headCommit === plan.headCommit
-            && target.planId === plan.planId;
+            && target.headCommit === plan.headCommit;
 }
 //# sourceMappingURL=types.js.map

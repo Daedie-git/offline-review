@@ -1,31 +1,31 @@
 import * as vscode from 'vscode';
+import { GitService, parseDiffDocumentUri } from '../git/gitService';
 
 /**
  * Forward language navigation from modified-side virtual documents to the
- * corresponding workspace file. Original/base snapshots are never forwarded
- * because their line positions do not describe the target file.
+ * corresponding file in the checkout captured by the prepared DiffPlan.
+ * Original/base snapshots are never forwarded because their line positions do
+ * not describe the target file.
  */
-export function registerVirtualDocLanguageFeatures(context: vscode.ExtensionContext): void {
+export function registerVirtualDocLanguageFeatures(
+    context: vscode.ExtensionContext,
+    gitService: GitService
+): void {
     const selector: vscode.DocumentSelector = { scheme: 'git-local-review' };
 
     const toRealUri = (virtualUri: vscode.Uri): vscode.Uri | undefined => {
-        const params = new URLSearchParams(virtualUri.query);
-        if (params.get('side') !== 'modified' && params.get('ref') !== 'WORKTREE') {
+        const parsed = parseDiffDocumentUri(virtualUri);
+        if (!parsed || parsed.side !== 'modified' || !parsed.worktreeRoot) {
             return undefined;
         }
-        const folder = vscode.workspace.workspaceFolders?.[0];
-        const filePath = virtualUri.path.startsWith('/')
-            ? virtualUri.path.slice(1)
-            : virtualUri.path;
-        if (!folder || !filePath) {
-            return undefined;
-        }
-        return vscode.Uri.joinPath(folder.uri, filePath);
+        return vscode.Uri.joinPath(vscode.Uri.file(parsed.worktreeRoot), parsed.filePath);
     };
 
     const ensureRealUri = async (virtualUri: vscode.Uri): Promise<vscode.Uri | undefined> => {
+        const parsed = parseDiffDocumentUri(virtualUri);
         const realUri = toRealUri(virtualUri);
-        if (!realUri) {
+        if (!parsed?.worktreeRoot || !realUri
+            || !await gitService.isLinkedWorktreeRoot(parsed.worktreeRoot)) {
             return undefined;
         }
         try {

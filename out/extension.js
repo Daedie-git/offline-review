@@ -36,6 +36,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
+const path = __importStar(require("path"));
 const gitService_1 = require("./git/gitService");
 const gitFileContentProvider_1 = require("./git/gitFileContentProvider");
 const localPrManager_1 = require("./services/localPrManager");
@@ -61,13 +62,13 @@ async function activate(context) {
     const storageService = new storageService_1.StorageService(localPrManager);
     const gitFileContentProvider = new gitFileContentProvider_1.GitFileContentProvider(gitService);
     context.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider('git-local-review', gitFileContentProvider));
-    (0, virtualDocLanguageFeatures_1.registerVirtualDocLanguageFeatures)(context);
+    (0, virtualDocLanguageFeatures_1.registerVirtualDocLanguageFeatures)(context, gitService);
     const branchSelectorProvider = new branchSelectorWebviewProvider_1.BranchSelectorWebviewProvider(context.extensionUri, gitService, localPrManager);
     const changedFilesProvider = new changedFilesProvider_1.ChangedFilesProvider(gitService, storageService, localPrManager);
     const localPrsProvider = new localPrsProvider_1.LocalPrsProvider(localPrManager);
     const localCommentsProvider = new localCommentsProvider_1.LocalCommentsProvider(storageService);
     const commentController = new commentController_1.ReviewCommentController(storageService);
-    const fileDecorationProvider = new fileDecorationProvider_1.ReviewFileDecorationProvider(storageService);
+    const fileDecorationProvider = new fileDecorationProvider_1.ReviewFileDecorationProvider(storageService, gitService);
     context.subscriptions.push(vscode.window.registerFileDecorationProvider(fileDecorationProvider));
     try {
         const localReviewTool = new localReviewTool_1.LocalReviewTool(gitService, localPrManager, storageService);
@@ -100,6 +101,8 @@ async function activate(context) {
     // Every review switch/refresh runs through this generation. Preparation does
     // not mutate visible state; one synchronous apply publishes only the winner.
     let transitionGeneration = 0;
+    /** Generation whose review state is fully visible; lower means a transition is in flight. */
+    let appliedTransitionGeneration = 0;
     const transitionToReview = async (review, options = {}, reservedGeneration) => {
         const generation = reservedGeneration ?? ++transitionGeneration;
         if (generation !== transitionGeneration) {
@@ -130,6 +133,7 @@ async function activate(context) {
             localPrsProvider.refresh();
             localCommentsProvider.refresh();
             fileDecorationProvider.refresh();
+            appliedTransitionGeneration = generation;
             return true;
         }
         catch (error) {
@@ -141,6 +145,7 @@ async function activate(context) {
     };
     const clearReviewUi = async () => {
         const generation = ++transitionGeneration;
+        localPrManager.deactivateReview();
         changedFilesProvider.clear();
         commentController.setReviewableFiles([]);
         commentController.loadAllThreads();
@@ -151,8 +156,10 @@ async function activate(context) {
         if (generation === transitionGeneration) {
             branchSelectorProvider.setReviewState({
                 currentBranch: currentBranch ?? '',
+                compare: currentBranch ?? '',
                 mode: localPrManager.getActiveMode(),
             });
+            appliedTransitionGeneration = generation;
         }
     };
     const getOrCreateUncommittedReview = async (branch) => {
@@ -170,28 +177,34 @@ async function activate(context) {
         const generation = ++transitionGeneration;
         const branch = await gitService.getCurrentBranch();
         if (generation !== transitionGeneration) {
-            return false;
+            return 'superseded';
         }
         if (!branch) {
             if (!options.quiet) {
                 vscode.window.showWarningMessage('Offline Review: no current Git branch (detached HEAD?).');
             }
-            return false;
+            return 'failed';
         }
         try {
             const review = await getOrCreateUncommittedReview(branch);
             const applied = await transitionToReview(review, { showError: !options.quiet }, generation);
-            if (applied && !options.quiet) {
+            if (!applied) {
+                return generation === transitionGeneration ? 'failed' : 'superseded';
+            }
+            if (!options.quiet) {
                 const count = changedFilesProvider.getAllFilePaths().length;
                 vscode.window.showInformationMessage(`Uncommitted review on ${branch}: ${count} file${count === 1 ? '' : 's'}`);
             }
-            return applied;
+            return 'applied';
         }
         catch (error) {
+            if (generation !== transitionGeneration) {
+                return 'superseded';
+            }
             if (!options.quiet) {
                 vscode.window.showErrorMessage(`Could not open uncommitted review: ${errorMessage(error)}`);
             }
-            return false;
+            return 'failed';
         }
     };
     const resolveBaseBranch = async (compareBranch, generation) => {
@@ -229,46 +242,52 @@ async function activate(context) {
         const generation = ++transitionGeneration;
         const branch = await gitService.getCurrentBranch();
         if (generation !== transitionGeneration) {
-            return false;
+            return 'superseded';
         }
         if (!branch) {
             if (!options.quiet) {
                 vscode.window.showWarningMessage('Offline Review: no current Git branch (detached HEAD?).');
             }
-            return false;
+            return 'failed';
         }
         try {
             const base = await resolveBaseBranch(branch, generation);
             if (generation !== transitionGeneration) {
-                return false;
+                return 'superseded';
             }
             if (!base) {
                 if (!options.quiet) {
                     vscode.window.showWarningMessage('Offline Review: no primary/base branch found. Fetch remote metadata or select a base branch.');
                 }
-                return false;
+                return 'failed';
             }
             const review = await getOrCreateBranchReview(base, branch);
             const applied = await transitionToReview(review, { showError: !options.quiet }, generation);
-            if (applied && !options.quiet) {
+            if (!applied) {
+                return generation === transitionGeneration ? 'failed' : 'superseded';
+            }
+            if (!options.quiet) {
                 const count = changedFilesProvider.getAllFilePaths().length;
                 const suffix = base === branch
                     ? ' (intentional primary-branch self-review)'
                     : '';
                 vscode.window.showInformationMessage(`Branch review: ${(0, types_1.formatReviewLabel)(review)} — ${count} file${count === 1 ? '' : 's'}${suffix}`);
             }
-            return applied;
+            return 'applied';
         }
         catch (error) {
+            if (generation !== transitionGeneration) {
+                return 'superseded';
+            }
             if (!options.quiet) {
                 vscode.window.showErrorMessage(`Could not open branch review: ${errorMessage(error)}`);
             }
-            return false;
+            return 'failed';
         }
     };
     const activateReviewFromUi = async (review) => {
         const generation = ++transitionGeneration;
-        if (review.mode !== 'uncommitted') {
+        if (review.mode === 'branch') {
             await transitionToReview(review, {}, generation);
             return;
         }
@@ -307,7 +326,7 @@ async function activate(context) {
     };
     const restoreModeAfterClear = async (mode, previous) => {
         if (mode === 'uncommitted') {
-            if (!await reviewUncommitted({ quiet: true })) {
+            if (await reviewUncommitted({ quiet: true }) === 'failed') {
                 await clearReviewUi();
             }
             return;
@@ -319,58 +338,117 @@ async function activate(context) {
                 if (await transitionToReview(review, { showError: false }, generation)) {
                     return;
                 }
+                if (generation !== transitionGeneration) {
+                    return;
+                }
             }
             catch {
-                // Fall back to a review of the currently checked-out branch.
+                if (generation !== transitionGeneration) {
+                    return;
+                }
+                // Fall back to a review of the selected worktree's branch.
             }
         }
-        if (!await reviewActiveBranch({ quiet: true })) {
+        if (await reviewActiveBranch({ quiet: true }) === 'failed') {
             await clearReviewUi();
         }
     };
     if (initialized) {
         const active = localPrManager.getActiveReview();
+        let restored = true;
         if (localPrManager.getActiveMode() === 'uncommitted') {
-            // Checkout identity wins on startup; never auto-checkout a saved branch.
-            await reviewUncommitted({ quiet: true });
+            // Local is the default worktree; never auto-checkout a saved branch.
+            restored = await reviewUncommitted({ quiet: true }) !== 'failed';
         }
         else if (active?.mode === 'branch') {
-            await transitionToReview(active);
+            restored = await transitionToReview(active);
+        }
+        else {
+            restored = await reviewActiveBranch({ quiet: true }) !== 'failed';
+        }
+        if (!restored) {
+            await clearReviewUi();
         }
     }
     let refreshTimer;
     context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(document => {
         const plan = changedFilesProvider.getDiffPlan();
         const active = localPrManager.getActiveReview();
-        if (!active || !plan || plan.kind !== 'worktree' || plan.reviewId !== active.id) {
+        if (transitionGeneration !== appliedTransitionGeneration
+            || !active || !plan || plan.kind !== 'worktree'
+            || plan.reviewId !== active.id) {
             return;
         }
         if (document.uri.scheme === 'file') {
-            gitFileContentProvider.refreshWorkingTreeFile(vscode.workspace.asRelativePath(document.uri, false));
+            const filePath = relativePathInRoot(document.uri.fsPath, plan.worktreeRoot);
+            if (!filePath) {
+                return;
+            }
+            gitFileContentProvider.refreshWorkingTreeFile(filePath, plan.worktreeRoot);
         }
         else {
-            gitFileContentProvider.refreshAllWorkingTree();
+            gitFileContentProvider.refreshAllWorkingTree(plan.worktreeRoot);
         }
         if (refreshTimer) {
             clearTimeout(refreshTimer);
         }
         const reviewId = active.id;
+        const planId = plan.planId;
+        const worktreeRoot = plan.worktreeRoot;
+        const backgroundGeneration = appliedTransitionGeneration;
         refreshTimer = setTimeout(() => {
             const current = localPrManager.getActiveReview();
             const appliedPlan = changedFilesProvider.getDiffPlan();
-            if (current?.id === reviewId
+            if (transitionGeneration === backgroundGeneration
+                && appliedTransitionGeneration === backgroundGeneration
+                && current?.id === reviewId
                 && appliedPlan?.kind === 'worktree'
-                && appliedPlan.reviewId === reviewId) {
-                void transitionToReview(current);
+                && appliedPlan.reviewId === reviewId
+                && appliedPlan.planId === planId
+                && appliedPlan.worktreeRoot === worktreeRoot
+                && gitService.getSelectedWorktreeRoot() === worktreeRoot) {
+                void reviewUncommitted({ quiet: true });
             }
         }, 500);
     }), { dispose: () => refreshTimer && clearTimeout(refreshTimer) });
+    let worktreeSelectionGeneration = 0;
     context.subscriptions.push(branchSelectorProvider.onDidSelectBranches(() => {
         // Selecting a base only updates preference. Mode buttons apply it.
+    }), gitService.onDidChangeWorktreeSelection(() => {
+        // The selector changes only Git review context. VS Code stays in the
+        // original workspace while this coordinator refreshes the mode.
+        const selectionGeneration = ++worktreeSelectionGeneration;
+        void (async () => {
+            const applySelectedMode = () => localPrManager.getActiveMode() === 'uncommitted'
+                ? reviewUncommitted({ quiet: true })
+                : reviewActiveBranch({ quiet: true });
+            let result = await applySelectedMode();
+            if (selectionGeneration !== worktreeSelectionGeneration) {
+                return;
+            }
+            const appliedPlan = changedFilesProvider.getDiffPlan();
+            if (result === 'superseded'
+                && appliedPlan?.worktreeRoot !== gitService.getSelectedWorktreeRoot()) {
+                // A background event raced the selector. Retry once so the
+                // latest selected checkout remains authoritative.
+                result = await applySelectedMode();
+                if (selectionGeneration !== worktreeSelectionGeneration) {
+                    return;
+                }
+            }
+            if (result === 'failed') {
+                await clearReviewUi();
+            }
+            branchSelectorProvider.refresh();
+            fileDecorationProvider.refresh();
+        })();
     }), gitService.onDidChangeCheckout(({ branch }) => {
+        if (!gitService.isLocalWorktreeSelected()) {
+            return;
+        }
         // Open worktree documents may survive checkouts; invalidate each
         // actual cached identity before preparing the next branch state.
-        gitFileContentProvider.refreshAllWorkingTree();
+        gitFileContentProvider.refreshAllWorkingTree(gitService.getSelectedWorktreeRoot());
         if (!branch) {
             // Reserve immediately so any in-flight transition for the former
             // branch cannot publish after the checkout becomes detached.
@@ -391,6 +469,9 @@ async function activate(context) {
             void reviewActiveBranch({ quiet: true });
         }
     }), gitService.onDidChangeHead(() => {
+        if (!gitService.isLocalWorktreeSelected()) {
+            return;
+        }
         void (async () => {
             const active = localPrManager.getActiveReview();
             if (!active) {
@@ -406,13 +487,19 @@ async function activate(context) {
     let commentsWatchTimer;
     const reloadCommentsFromDisk = () => {
         const active = localPrManager.getActiveReview();
-        if (active) {
+        const plan = changedFilesProvider.getDiffPlan();
+        if (transitionGeneration === appliedTransitionGeneration
+            && active
+            && plan?.reviewId === active.id
+            && plan.worktreeRoot === gitService.getSelectedWorktreeRoot()) {
             void transitionToReview(active, {
                 ensureCommentsFile: false,
                 showError: false,
             });
         }
         else {
+            // A worktree transition may still be preparing. Do not let a stale
+            // comments event supersede it; the transition will load comments.
             localCommentsProvider.refresh();
         }
     };
@@ -534,12 +621,20 @@ async function activate(context) {
         vscode.window.showInformationMessage('All review comments cleared.');
     }));
     context.subscriptions.push(vscode.commands.registerCommand('localPrReview.refreshFiles', async () => {
+        const plan = changedFilesProvider.getDiffPlan();
+        if (plan?.kind === 'worktree') {
+            gitFileContentProvider.refreshAllWorkingTree(plan.worktreeRoot);
+        }
         const active = localPrManager.getActiveReview();
-        if (active) {
-            if (changedFilesProvider.getDiffPlan()?.kind === 'worktree') {
-                gitFileContentProvider.refreshAllWorkingTree();
-            }
-            await transitionToReview(active);
+        if (active?.mode === 'branch'
+            && plan?.worktreeRoot === gitService.getSelectedWorktreeRoot()) {
+            await transitionToReview(active, { showError: false });
+        }
+        else if (localPrManager.getActiveMode() === 'uncommitted') {
+            await reviewUncommitted({ quiet: true });
+        }
+        else {
+            await reviewActiveBranch({ quiet: true });
         }
     }), vscode.commands.registerCommand('localPrReview.expandAll', async () => {
         for (const item of changedFilesProvider.getAllExpandableItems()) {
@@ -555,10 +650,7 @@ async function activate(context) {
             }
         }
     }), vscode.commands.registerCommand('localPrReview.openFile', async (item) => {
-        const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-        if (root) {
-            await vscode.window.showTextDocument(vscode.Uri.joinPath(root, item.fileChange.filePath));
-        }
+        await vscode.window.showTextDocument(vscode.Uri.joinPath(vscode.Uri.file(item.diffPlan.worktreeRoot), item.fileChange.filePath));
     }), vscode.commands.registerCommand('localPrReview.openDiff', async (item) => {
         const review = localPrManager.getReviewById(item.diffPlan.reviewId);
         const title = review
@@ -736,6 +828,14 @@ function extractFilePath(uri) {
         return vscode.workspace.asRelativePath(uri, false);
     }
     return uri.path.startsWith('/') ? uri.path.slice(1) : uri.path;
+}
+function relativePathInRoot(filePath, root) {
+    const relative = path.relative(root, filePath);
+    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`)
+        || path.isAbsolute(relative)) {
+        return undefined;
+    }
+    return relative.split(path.sep).join('/');
 }
 function errorMessage(error) {
     return error instanceof Error ? error.message : String(error);

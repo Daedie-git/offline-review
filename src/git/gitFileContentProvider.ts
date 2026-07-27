@@ -16,27 +16,27 @@ export class GitFileContentProvider implements vscode.TextDocumentContentProvide
         if (!parsed) {
             return '';
         }
-        const ref = parsed.document.kind === 'worktree'
-            ? GitService.WORKTREE_REF
-            : parsed.document.ref;
-        return this.gitService.getFileContent(ref, parsed.filePath);
+        return this.gitService.getFileContent(parsed.document, parsed.filePath);
     }
 
-    /** Invalidate every open WORKTREE identity for one real file. */
-    refreshWorkingTreeFile(filePath: string): void {
+    /** Invalidate open identities for one real file in one captured checkout. */
+    refreshWorkingTreeFile(filePath: string, worktreeRoot?: string): void {
         for (const document of vscode.workspace.textDocuments) {
             const parsed = parseDiffDocumentUri(document.uri);
-            if (parsed?.document.kind === 'worktree' && parsed.filePath === filePath) {
+            if (parsed?.document.kind === 'worktree'
+                && parsed.filePath === filePath
+                && (!worktreeRoot || parsed.document.worktreeRoot === worktreeRoot)) {
                 this._onDidChange.fire(document.uri);
             }
         }
     }
 
-    /** Invalidate every open WORKTREE virtual document. */
-    refreshAllWorkingTree(): void {
+    /** Invalidate open WORKTREE documents, optionally for one checkout only. */
+    refreshAllWorkingTree(worktreeRoot?: string): void {
         for (const document of vscode.workspace.textDocuments) {
             const parsed = parseDiffDocumentUri(document.uri);
-            if (parsed?.document.kind === 'worktree') {
+            if (parsed?.document.kind === 'worktree'
+                && (!worktreeRoot || parsed.document.worktreeRoot === worktreeRoot)) {
                 this._onDidChange.fire(document.uri);
             }
         }

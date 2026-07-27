@@ -58,7 +58,8 @@ export class ReviewCommentController {
                             this.activePlan.right,
                             filePath,
                             'modified',
-                            this.activePlan.reviewId
+                            this.activePlan.reviewId,
+                            this.activePlan.worktreeRoot
                         );
                         if (document.uri.toString() !== expected.toString()) {
                             return [];
@@ -100,7 +101,8 @@ export class ReviewCommentController {
                 plan.right,
                 filePath,
                 'modified',
-                plan.reviewId
+                plan.reviewId,
+                plan.worktreeRoot
             );
             if (targetUri.toString() !== expected.toString()) {
                 return;
@@ -144,7 +146,7 @@ export class ReviewCommentController {
 
         for (const thread of comments.threads) {
             const target = thread.target;
-            const targetUri = threadTargetUri(target, plan.reviewId);
+            const targetUri = threadTargetUri(target, plan);
             this.createVscodeThread(
                 plan.reviewId,
                 targetUri,
@@ -204,7 +206,8 @@ export class ReviewCommentController {
                 plan.right,
                 filePath,
                 'modified',
-                plan.reviewId
+                plan.reviewId,
+                plan.worktreeRoot
             );
             if (uri.toString() !== expected.toString()) {
                 throw new Error('Comments can only be added to the prepared diff target');
@@ -519,14 +522,29 @@ function targetFromPlan(plan: DiffPlan, filePath: string): ReviewThreadTarget {
         };
 }
 
-function threadTargetUri(target: ReviewThreadTarget, reviewId: string): vscode.Uri {
+function threadTargetUri(target: ReviewThreadTarget, plan: DiffPlan): vscode.Uri {
+    const currentWorktreeTarget = target.kind === 'worktree'
+        && plan.kind === 'worktree'
+        && target.reviewId === plan.reviewId
+        && target.headCommit === plan.headCommit;
     const document = target.kind === 'git'
         ? { kind: 'git' as const, ref: target.ref }
         : {
             kind: 'worktree' as const,
-            reviewId,
+            reviewId: plan.reviewId,
             headCommit: target.headCommit,
-            planId: target.planId,
+            // The URI nonce changes on refresh to invalidate VS Code's cache,
+            // while same-HEAD comments remain attached to the current document.
+            planId: currentWorktreeTarget ? plan.planId : target.planId,
+            // The persisted schema intentionally remains unchanged. During this
+            // activation, thread documents use the prepared checkout identity.
+            worktreeRoot: plan.worktreeRoot,
         };
-    return getDiffDocumentUri(document, target.filePath, 'modified', reviewId);
+    return getDiffDocumentUri(
+        document,
+        target.filePath,
+        'modified',
+        plan.reviewId,
+        plan.worktreeRoot
+    );
 }

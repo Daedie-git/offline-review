@@ -351,6 +351,16 @@ export class LocalPrManager {
             : undefined;
     }
 
+    /** Clear only the active pointer; saved reviews and comments remain intact. */
+    deactivateReview(): boolean {
+        if (this.registry.activeReviewId === undefined) {
+            return false;
+        }
+        this.registry.activeReviewId = undefined;
+        this.saveRegistry();
+        return true;
+    }
+
     listReviews(): LocalPr[] {
         return [...this.registry.reviews];
     }

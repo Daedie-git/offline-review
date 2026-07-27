@@ -37,8 +37,9 @@ exports.ReviewFileDecorationProvider = void 0;
 const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
 class ReviewFileDecorationProvider {
-    constructor(storageService) {
+    constructor(storageService, gitService) {
         this.storageService = storageService;
+        this.gitService = gitService;
         this._onDidChangeFileDecorations = new vscode.EventEmitter();
         this.onDidChangeFileDecorations = this._onDidChangeFileDecorations.event;
     }
@@ -47,11 +48,11 @@ class ReviewFileDecorationProvider {
         if (uri.scheme !== 'file') {
             return undefined;
         }
-        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        if (!workspaceRoot) {
+        const worktreeRoot = this.gitService.getSelectedWorktreeRoot();
+        if (!worktreeRoot) {
             return undefined;
         }
-        const relative = path.relative(workspaceRoot, uri.fsPath);
+        const relative = path.relative(worktreeRoot, uri.fsPath);
         if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
             return undefined;
         }

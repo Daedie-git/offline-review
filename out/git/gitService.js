@@ -37,6 +37,7 @@ exports.GitService = void 0;
 exports.getDiffDocumentUri = getDiffDocumentUri;
 exports.parseDiffDocumentUri = parseDiffDocumentUri;
 exports.getFileDiffUris = getFileDiffUris;
+exports.parseWorktreeList = parseWorktreeList;
 const vscode = __importStar(require("vscode"));
 const cp = __importStar(require("child_process"));
 const crypto = __importStar(require("crypto"));
@@ -46,10 +47,16 @@ const MAX_GIT_OUTPUT = 10 * 1024 * 1024;
 const DEFAULT_GIT_TIMEOUT = 30000;
 const GIT_URI_SCHEME = 'git-local-review';
 /** Build a virtual-document URI from an already resolved document decision. */
-function getDiffDocumentUri(document, filePath, side, reviewId) {
+function getDiffDocumentUri(document, filePath, side, reviewId, capturedWorktreeRoot) {
     const query = new URLSearchParams({
         ref: document.kind === 'worktree' ? GitService.WORKTREE_REF : document.ref,
     });
+    const worktreeRoot = document.kind === 'worktree'
+        ? document.worktreeRoot
+        : capturedWorktreeRoot;
+    if (worktreeRoot) {
+        query.set('worktreeRoot', normalizeRoot(worktreeRoot));
+    }
     if (side) {
         query.set('side', side);
     }
@@ -74,7 +81,7 @@ function parseDiffDocumentUri(uri) {
         return undefined;
     }
     const filePath = uri.path.startsWith('/') ? uri.path.slice(1) : uri.path;
-    if (!filePath) {
+    if (!isSafeRelativeGitPath(filePath)) {
         return undefined;
     }
     const query = new URLSearchParams(uri.query);
@@ -85,19 +92,33 @@ function parseDiffDocumentUri(uri) {
     }
     const side = sideValue ?? undefined;
     const reviewId = query.get('reviewId') ?? undefined;
+    const rootValue = query.get('worktreeRoot');
+    const worktreeRoot = rootValue && isAbsoluteNormalizedRoot(rootValue)
+        ? rootValue
+        : undefined;
+    if (rootValue && !worktreeRoot) {
+        return undefined;
+    }
     if (ref === GitService.WORKTREE_REF) {
         const headCommit = query.get('head');
         const planId = query.get('planId');
         if (side !== 'modified' || !reviewId || !isUuid(reviewId)
             || !headCommit || !isFullObjectId(headCommit)
-            || !planId || !isUuid(planId)) {
+            || !planId || !isUuid(planId) || !worktreeRoot) {
             return undefined;
         }
         return {
             filePath,
             side,
             reviewId,
-            document: { kind: 'worktree', reviewId, headCommit, planId },
+            worktreeRoot,
+            document: {
+                kind: 'worktree',
+                reviewId,
+                headCommit,
+                planId,
+                worktreeRoot,
+            },
         };
     }
     if (!ref || !isFullObjectId(ref) || (reviewId && !isUuid(reviewId))) {
@@ -107,6 +128,7 @@ function parseDiffDocumentUri(uri) {
         filePath,
         side,
         reviewId,
+        worktreeRoot,
         document: { kind: 'git', ref },
     };
 }
@@ -115,13 +137,17 @@ function getFileDiffUris(plan, change) {
         ? change.oldFilePath
         : change.filePath;
     return Object.freeze({
-        left: getDiffDocumentUri(plan.left, leftPath, 'original', plan.reviewId),
-        right: getDiffDocumentUri(plan.right, change.filePath, 'modified', plan.reviewId),
+        left: getDiffDocumentUri(plan.left, leftPath, 'original', plan.reviewId, plan.worktreeRoot),
+        right: getDiffDocumentUri(plan.right, change.filePath, 'modified', plan.reviewId, plan.worktreeRoot),
     });
 }
 class GitService {
     constructor(context) {
         this.context = context;
+        /** Last-request-wins guard for overlapping webview selection messages. */
+        this.worktreeSelectionGeneration = 0;
+        this._onDidChangeWorktreeSelection = new vscode.EventEmitter();
+        this.onDidChangeWorktreeSelection = this._onDidChangeWorktreeSelection.event;
         /** Compatibility event for named-branch checkouts. */
         this._onDidChangeBranch = new vscode.EventEmitter();
         this.onDidChangeBranch = this._onDidChangeBranch.event;
@@ -129,7 +155,10 @@ class GitService {
         this.onDidChangeCheckout = this._onDidChangeCheckout.event;
         this._onDidChangeHead = new vscode.EventEmitter();
         this.onDidChangeHead = this._onDidChangeHead.event;
-        this.workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+        this.localWorkspaceRoot = normalizeRoot(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '');
+        this.localWorktreeRoot = this.localWorkspaceRoot;
+        this.selectedWorktreeRoot = this.localWorkspaceRoot;
+        this.context.subscriptions.push(this._onDidChangeWorktreeSelection);
     }
     async initialize() {
         const gitExtension = vscode.extensions.getExtension('vscode.git');
@@ -141,8 +170,15 @@ class GitService {
             await gitExtension.activate();
         }
         const api = gitExtension.exports.getAPI(1);
-        if (api.repositories.length > 0) {
-            this.repo = api.repositories[0];
+        try {
+            await this.initializeLocalWorktreeRoot();
+        }
+        catch {
+            return false;
+        }
+        const matchingRepository = api.repositories.find(repo => sameRoot(repo.rootUri.fsPath, this.localWorktreeRoot));
+        if (matchingRepository) {
+            this.repo = matchingRepository;
             this.trackBranchChanges();
             return true;
         }
@@ -152,6 +188,9 @@ class GitService {
                 resolve(false);
             }, 10000);
             const disposable = api.onDidOpenRepository((repo) => {
+                if (!sameRoot(repo.rootUri.fsPath, this.localWorktreeRoot)) {
+                    return;
+                }
                 clearTimeout(timeout);
                 disposable.dispose();
                 this.repo = repo;
@@ -159,6 +198,14 @@ class GitService {
                 resolve(true);
             });
         });
+    }
+    async initializeLocalWorktreeRoot() {
+        const root = (await this.execGit(['rev-parse', '--show-toplevel'], DEFAULT_GIT_TIMEOUT, this.localWorkspaceRoot)).trim();
+        if (!root || !path.isAbsolute(root)) {
+            throw new Error('Git did not return the local worktree root');
+        }
+        this.localWorktreeRoot = normalizeRoot(root);
+        this.selectedWorktreeRoot = this.localWorktreeRoot;
     }
     trackBranchChanges() {
         if (!this.repo) {
@@ -185,6 +232,115 @@ class GitService {
         });
         this.context.subscriptions.push(disposable);
     }
+    getLocalWorkspaceRoot() {
+        return this.localWorkspaceRoot;
+    }
+    getSelectedWorktreeRoot() {
+        return this.selectedWorktreeRoot;
+    }
+    isLocalWorktreeSelected() {
+        return sameRoot(this.selectedWorktreeRoot, this.localWorktreeRoot);
+    }
+    /** Always discover linked worktrees from the original workspace checkout. */
+    async listWorktrees() {
+        const output = await this.execGit(['worktree', 'list', '--porcelain', '-z'], DEFAULT_GIT_TIMEOUT, this.localWorkspaceRoot);
+        return parseWorktreeList(output, this.localWorktreeRoot);
+    }
+    /** Select one currently linked and accessible checkout for this session. */
+    async selectWorktree(root) {
+        const generation = ++this.worktreeSelectionGeneration;
+        const normalized = normalizeRoot(root);
+        const worktrees = await this.listWorktrees();
+        const currentSelection = () => worktrees.find(candidate => sameRoot(candidate.root, this.selectedWorktreeRoot));
+        const selected = worktrees.find(candidate => sameRoot(candidate.root, normalized));
+        if (!selected) {
+            const current = currentSelection();
+            if (generation !== this.worktreeSelectionGeneration && current) {
+                return current;
+            }
+            throw new Error(`The selected Git worktree is no longer linked: ${root}`);
+        }
+        if (!await this.validateLinkedWorktreeRoot(selected.root)) {
+            const current = currentSelection();
+            if (generation !== this.worktreeSelectionGeneration && current) {
+                return current;
+            }
+            throw new Error(`The selected Git worktree is no longer available: ${selected.root}`);
+        }
+        // A slower, older request must not overwrite the user's latest choice.
+        if (generation !== this.worktreeSelectionGeneration) {
+            return currentSelection() ?? selected;
+        }
+        if (!sameRoot(this.selectedWorktreeRoot, selected.root)) {
+            this.selectedWorktreeRoot = selected.root;
+            this._onDidChangeWorktreeSelection.fire(selected);
+        }
+        return selected;
+    }
+    /** Validate an identity embedded in a virtual URI without trusting its path. */
+    async isLinkedWorktreeRoot(root) {
+        if (!isAbsoluteNormalizedRoot(root)) {
+            return false;
+        }
+        try {
+            const worktrees = await this.listWorktrees();
+            const linked = worktrees.find(candidate => sameRoot(candidate.root, root));
+            return Boolean(linked) && await this.validateLinkedWorktreeRoot(root);
+        }
+        catch {
+            return false;
+        }
+    }
+    /**
+     * Revalidate both the filesystem entry and common Git directory. A stale
+     * worktree-list path must never authorize an unrelated repository or symlink.
+     */
+    async validateLinkedWorktreeRoot(root) {
+        try {
+            const stat = await fs.promises.lstat(root);
+            if (!stat.isDirectory() || stat.isSymbolicLink()) {
+                return false;
+            }
+            const inside = (await this.execGit(['rev-parse', '--is-inside-work-tree'], DEFAULT_GIT_TIMEOUT, root)).trim();
+            if (inside !== 'true') {
+                return false;
+            }
+            const [candidateCommonDir, localCommonDir] = await Promise.all([
+                this.getCommonGitDir(root),
+                this.getCommonGitDir(this.localWorkspaceRoot),
+            ]);
+            return sameRoot(candidateCommonDir, localCommonDir);
+        }
+        catch {
+            return false;
+        }
+    }
+    async getCommonGitDir(root) {
+        const commonDir = (await this.execGit(['rev-parse', '--path-format=absolute', '--git-common-dir'], DEFAULT_GIT_TIMEOUT, root)).trim();
+        if (!commonDir || !path.isAbsolute(commonDir)) {
+            throw new Error('Git did not return an absolute common directory');
+        }
+        return normalizeRoot(await fs.promises.realpath(commonDir));
+    }
+    async requireLinkedWorktreeRoot(root) {
+        if (await this.isLinkedWorktreeRoot(root)) {
+            return;
+        }
+        // Fail closed, and return the live selector to Local when an external
+        // checkout disappears or is replaced while the extension is running.
+        if (sameRoot(root, this.selectedWorktreeRoot)
+            && !sameRoot(root, this.localWorktreeRoot)
+            && await this.isLinkedWorktreeRoot(this.localWorktreeRoot)) {
+            const worktrees = await this.listWorktrees();
+            const local = worktrees.find(candidate => candidate.isLocal);
+            if (local) {
+                this.worktreeSelectionGeneration++;
+                this.selectedWorktreeRoot = local.root;
+                this._onDidChangeWorktreeSelection.fire(local);
+            }
+        }
+        throw new Error(`Git worktree is no longer linked to this repository: ${root}`);
+    }
     async getBranches(includeRemote = false) {
         if (!this.repo) {
             return [];
@@ -209,7 +365,20 @@ class GitService {
         }
     }
     async getCurrentBranch() {
-        return this.repo?.state.HEAD?.name;
+        const root = this.selectedWorktreeRoot;
+        return this.getCurrentBranchAt(root);
+    }
+    async getCurrentBranchAt(root, alreadyValidated = false) {
+        if (!alreadyValidated) {
+            await this.requireLinkedWorktreeRoot(root);
+        }
+        try {
+            const branch = (await this.execGit(['symbolic-ref', '--quiet', '--short', 'HEAD'], DEFAULT_GIT_TIMEOUT, root)).trim();
+            return branch || undefined;
+        }
+        catch {
+            return undefined;
+        }
     }
     /** Detect the primary branch from remote metadata without guessing names. */
     async getPrimaryBranch(branches, excludeBranch, options = {}) {
@@ -294,23 +463,29 @@ class GitService {
         if (!branch) {
             throw new Error('Cannot switch to an empty branch name');
         }
-        await this.execGit(['checkout', branch]);
+        const worktreeRoot = this.selectedWorktreeRoot;
+        await this.requireLinkedWorktreeRoot(worktreeRoot);
+        await this.execGit(['checkout', branch], DEFAULT_GIT_TIMEOUT, worktreeRoot);
     }
     /** Resolve a persisted review into one explicit, immutable diff strategy. */
     async prepareDiffPlan(review) {
+        // Capture before the first await so a concurrent selector change cannot
+        // mix Git commands or document identities from two linked checkouts.
+        const worktreeRoot = this.selectedWorktreeRoot;
+        await this.requireLinkedWorktreeRoot(worktreeRoot);
         if (review.mode === 'branch') {
             // Resolve branch names on every refresh so newly-created commits are
             // included, then freeze this refresh to immutable object IDs. Saved
             // commits remain a fallback for reviews whose branches were deleted.
             const [baseCommit, targetCommit] = await Promise.all([
-                this.resolveCommitWithFallback(review.baseBranch, review.sourceCommit),
-                this.resolveCommitWithFallback(review.targetBranch, review.targetCommit),
+                this.resolveCommitWithFallback(review.baseBranch, review.sourceCommit, worktreeRoot),
+                this.resolveCommitWithFallback(review.targetBranch, review.targetCommit, worktreeRoot),
             ]);
             const mergeBaseCommit = (await this.execGit([
                 'merge-base',
                 baseCommit,
                 targetCommit,
-            ])).trim();
+            ], DEFAULT_GIT_TIMEOUT, worktreeRoot)).trim();
             if (!isFullObjectId(mergeBaseCommit)) {
                 throw new Error('Git did not return an immutable merge-base commit');
             }
@@ -319,6 +494,7 @@ class GitService {
             return Object.freeze({
                 kind: 'branch',
                 reviewId: review.id,
+                worktreeRoot,
                 baseBranch: review.baseBranch,
                 targetBranch: review.targetBranch,
                 baseCommit,
@@ -328,14 +504,14 @@ class GitService {
                 right,
             });
         }
-        const currentBranch = await this.getCurrentBranch();
+        const currentBranch = await this.getCurrentBranchAt(worktreeRoot, true);
         if (!currentBranch) {
             throw new Error('Cannot review uncommitted changes from detached HEAD');
         }
         if (currentBranch !== review.branch) {
             throw new Error(`Uncommitted review is saved for branch "${review.branch}", but "${currentBranch}" is checked out`);
         }
-        const headCommit = await this.resolveCommit('HEAD');
+        const headCommit = await this.resolveCommit('HEAD', worktreeRoot);
         const planId = crypto.randomUUID();
         const left = Object.freeze({ kind: 'git', ref: headCommit });
         const right = Object.freeze({
@@ -343,10 +519,12 @@ class GitService {
             reviewId: review.id,
             headCommit,
             planId,
+            worktreeRoot,
         });
         return Object.freeze({
             kind: 'worktree',
             reviewId: review.id,
+            worktreeRoot,
             branch: review.branch,
             headCommit,
             planId,
@@ -356,6 +534,7 @@ class GitService {
     }
     async getChangedFiles(plan) {
         this.assertValidPlan(plan);
+        await this.requireLinkedWorktreeRoot(plan.worktreeRoot);
         const output = plan.kind === 'branch'
             ? await this.execGit([
                 'diff',
@@ -366,7 +545,7 @@ class GitService {
                 plan.mergeBaseCommit,
                 plan.targetCommit,
                 '--',
-            ])
+            ], DEFAULT_GIT_TIMEOUT, plan.worktreeRoot)
             : await this.execGit([
                 'diff',
                 '--no-ext-diff',
@@ -375,7 +554,7 @@ class GitService {
                 '--find-renames',
                 plan.headCommit,
                 '--',
-            ]);
+            ], DEFAULT_GIT_TIMEOUT, plan.worktreeRoot);
         const files = parseNameStatus(output);
         if (plan.kind === 'worktree') {
             const untrackedOutput = await this.execGit([
@@ -384,7 +563,7 @@ class GitService {
                 '--exclude-standard',
                 '-z',
                 '--',
-            ]);
+            ], DEFAULT_GIT_TIMEOUT, plan.worktreeRoot);
             const seen = new Set(files.map(file => file.filePath));
             for (const filePath of splitNul(untrackedOutput)) {
                 if (!seen.has(filePath)) {
@@ -406,15 +585,20 @@ class GitService {
     getFileDiffUris(plan, change) {
         return getFileDiffUris(plan, change);
     }
-    async getFileContent(ref, filePath) {
-        if (ref === GitService.WORKTREE_REF) {
-            return this.getWorkingTreeFileContent(filePath);
+    async getFileContent(document, filePath) {
+        if (!isSafeRelativeGitPath(filePath)) {
+            return '';
         }
-        if (!isFullObjectId(ref)) {
+        if (document.kind === 'worktree') {
+            return this.getWorkingTreeFileContent(document.worktreeRoot, filePath);
+        }
+        if (!isFullObjectId(document.ref)) {
             return '';
         }
         try {
-            return await this.execGit(['cat-file', 'blob', `${ref}:${filePath}`]);
+            // Linked worktrees share object storage. Reading immutable objects
+            // from Local avoids trusting a root supplied by a virtual URI.
+            return await this.execGit(['cat-file', 'blob', `${document.ref}:${filePath}`], DEFAULT_GIT_TIMEOUT, this.localWorkspaceRoot);
         }
         catch {
             return '';
@@ -424,10 +608,11 @@ class GitService {
         if (plan.kind === 'worktree') {
             return [];
         }
-        return this.getCommitsBetween(plan.mergeBaseCommit, plan.targetCommit);
+        await this.requireLinkedWorktreeRoot(plan.worktreeRoot);
+        return this.getCommitsBetween(plan.mergeBaseCommit, plan.targetCommit, plan.worktreeRoot);
     }
     /** Both arguments must be immutable commit hashes. */
-    async getCommitsBetween(sourceCommit, targetCommit) {
+    async getCommitsBetween(sourceCommit, targetCommit, worktreeRoot = this.selectedWorktreeRoot) {
         assertFullObjectId(sourceCommit, 'source commit');
         assertFullObjectId(targetCommit, 'target commit');
         const fieldSeparator = '\u001f';
@@ -446,7 +631,7 @@ class GitService {
                 `--format=${format}`,
                 `${sourceCommit}..${targetCommit}`,
                 '--',
-            ]);
+            ], DEFAULT_GIT_TIMEOUT, worktreeRoot);
             return output
                 .split(recordSeparator)
                 .map(record => record.replace(/^\n+|\n+$/g, ''))
@@ -460,18 +645,18 @@ class GitService {
             return [];
         }
     }
-    async resolveCommitWithFallback(ref, fallbackCommit) {
+    async resolveCommitWithFallback(ref, fallbackCommit, worktreeRoot) {
         try {
-            return await this.resolveCommit(ref);
+            return await this.resolveCommit(ref, worktreeRoot);
         }
         catch (error) {
             if (!fallbackCommit) {
                 throw error;
             }
-            return this.resolveCommit(fallbackCommit);
+            return this.resolveCommit(fallbackCommit, worktreeRoot);
         }
     }
-    async resolveCommit(ref) {
+    async resolveCommit(ref, worktreeRoot = this.selectedWorktreeRoot) {
         if (!ref) {
             throw new Error('Cannot resolve an empty Git ref');
         }
@@ -480,17 +665,29 @@ class GitService {
             '--verify',
             '--end-of-options',
             `${ref}^{commit}`,
-        ])).trim();
+        ], DEFAULT_GIT_TIMEOUT, worktreeRoot)).trim();
         if (!isFullObjectId(resolved)) {
             throw new Error(`Git ref "${ref}" did not resolve to a full commit hash`);
         }
         return resolved;
     }
-    async getWorkingTreeFileContent(filePath) {
+    async getWorkingTreeFileContent(worktreeRoot, filePath) {
         try {
-            const root = path.resolve(this.workspaceRoot);
+            if (!await this.isLinkedWorktreeRoot(worktreeRoot)) {
+                return '';
+            }
+            const root = normalizeRoot(worktreeRoot);
             const absolutePath = path.resolve(root, filePath);
-            if (!filePath || (absolutePath !== root && !absolutePath.startsWith(`${root}${path.sep}`))) {
+            if (!isPathInside(root, absolutePath)) {
+                return '';
+            }
+            // Resolve the parent to prevent an untracked symlinked directory
+            // from turning a forged virtual URI into an arbitrary file read.
+            const [realRoot, realParent] = await Promise.all([
+                fs.promises.realpath(root),
+                fs.promises.realpath(path.dirname(absolutePath)),
+            ]);
+            if (!isPathInside(realRoot, realParent, true)) {
                 return '';
             }
             const stat = await fs.promises.lstat(absolutePath);
@@ -500,13 +697,20 @@ class GitService {
             if (!stat.isFile()) {
                 return '';
             }
-            return await fs.promises.readFile(absolutePath, 'utf8');
+            const realFile = await fs.promises.realpath(absolutePath);
+            if (!isPathInside(realRoot, realFile)) {
+                return '';
+            }
+            return await fs.promises.readFile(realFile, 'utf8');
         }
         catch {
             return '';
         }
     }
     assertValidPlan(plan) {
+        if (!isAbsoluteNormalizedRoot(plan.worktreeRoot)) {
+            throw new Error('DiffPlan worktree root is not an absolute normalized path');
+        }
         if (plan.kind === 'branch') {
             assertFullObjectId(plan.baseCommit, 'base commit');
             assertFullObjectId(plan.mergeBaseCommit, 'merge-base commit');
@@ -522,17 +726,18 @@ class GitService {
             || plan.right.reviewId !== plan.reviewId
             || plan.right.headCommit !== plan.headCommit
             || plan.right.planId !== plan.planId
+            || !sameRoot(plan.right.worktreeRoot, plan.worktreeRoot)
             || !isUuid(plan.planId)) {
             throw new Error('Worktree DiffPlan document refs do not match its strategy');
         }
     }
-    execGit(args, timeout = DEFAULT_GIT_TIMEOUT) {
-        if (!this.workspaceRoot) {
+    execGit(args, timeout = DEFAULT_GIT_TIMEOUT, worktreeRoot = this.selectedWorktreeRoot) {
+        if (!worktreeRoot) {
             return Promise.reject(new Error('No workspace folder is open'));
         }
         return new Promise((resolve, reject) => {
             cp.execFile('git', [...args], {
-                cwd: this.workspaceRoot,
+                cwd: worktreeRoot,
                 encoding: 'utf8',
                 maxBuffer: MAX_GIT_OUTPUT,
                 timeout,
@@ -550,6 +755,72 @@ class GitService {
 }
 exports.GitService = GitService;
 GitService.WORKTREE_REF = 'WORKTREE';
+/** Parse NUL-delimited porcelain without treating spaces or newlines as separators. */
+function parseWorktreeList(output, localWorktreeRoot) {
+    const records = [];
+    let record = [];
+    for (const token of output.split('\0')) {
+        if (token === '') {
+            if (record.length > 0) {
+                records.push(record);
+                record = [];
+            }
+        }
+        else {
+            record.push(token);
+        }
+    }
+    if (record.length > 0) {
+        records.push(record);
+    }
+    const localRoot = normalizeRoot(localWorktreeRoot);
+    const worktrees = [];
+    for (const fields of records) {
+        let root;
+        let headCommit;
+        let branch;
+        let detached = false;
+        let unavailable = false;
+        for (const field of fields) {
+            const separator = field.indexOf(' ');
+            const key = separator === -1 ? field : field.slice(0, separator);
+            const value = separator === -1 ? '' : field.slice(separator + 1);
+            switch (key) {
+                case 'worktree':
+                    root = value;
+                    break;
+                case 'HEAD':
+                    headCommit = value;
+                    break;
+                case 'branch':
+                    branch = value.startsWith('refs/heads/')
+                        ? value.slice('refs/heads/'.length)
+                        : value;
+                    break;
+                case 'detached':
+                    detached = true;
+                    break;
+                case 'bare':
+                case 'prunable':
+                    unavailable = true;
+                    break;
+            }
+        }
+        if (unavailable || !root || !path.isAbsolute(root)
+            || !headCommit || !isFullObjectId(headCommit)) {
+            continue;
+        }
+        const normalizedRoot = normalizeRoot(root);
+        worktrees.push(Object.freeze({
+            root: normalizedRoot,
+            headCommit,
+            branch: detached ? undefined : branch,
+            detached: detached || !branch,
+            isLocal: sameRoot(normalizedRoot, localRoot),
+        }));
+    }
+    return worktrees;
+}
 function parseNameStatus(output) {
     const tokens = splitNul(output);
     const files = [];
@@ -591,6 +862,40 @@ function splitNul(output) {
 }
 function splitLines(output) {
     return output.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+}
+function normalizeRoot(root) {
+    return root ? path.resolve(root) : '';
+}
+function sameRoot(left, right) {
+    const normalizedLeft = normalizeRoot(left);
+    const normalizedRight = normalizeRoot(right);
+    return process.platform === 'win32'
+        ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+        : normalizedLeft === normalizedRight;
+}
+function isAbsoluteNormalizedRoot(root) {
+    if (!root || root.includes('\0') || !path.isAbsolute(root)) {
+        return false;
+    }
+    const normalized = normalizeRoot(root);
+    return process.platform === 'win32'
+        ? root.toLowerCase() === normalized.toLowerCase()
+        : root === normalized;
+}
+function isSafeRelativeGitPath(filePath) {
+    if (!filePath || filePath.includes('\0') || path.isAbsolute(filePath)) {
+        return false;
+    }
+    return !filePath.split(/[\\/]/).some(segment => segment === '..' || segment === '');
+}
+function isPathInside(root, candidate, allowEqual = false) {
+    const relative = path.relative(root, candidate);
+    if (relative === '') {
+        return allowEqual;
+    }
+    return relative !== '..'
+        && !relative.startsWith(`..${path.sep}`)
+        && !path.isAbsolute(relative);
 }
 function isFullObjectId(value) {
     return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value);

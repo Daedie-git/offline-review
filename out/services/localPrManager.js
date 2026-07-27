@@ -298,6 +298,15 @@ class LocalPrManager {
             ? this.getReviewById(this.registry.activeReviewId)
             : undefined;
     }
+    /** Clear only the active pointer; saved reviews and comments remain intact. */
+    deactivateReview() {
+        if (this.registry.activeReviewId === undefined) {
+            return false;
+        }
+        this.registry.activeReviewId = undefined;
+        this.saveRegistry();
+        return true;
+    }
     listReviews() {
         return [...this.registry.reviews];
     }

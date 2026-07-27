@@ -35,30 +35,27 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.registerVirtualDocLanguageFeatures = registerVirtualDocLanguageFeatures;
 const vscode = __importStar(require("vscode"));
+const gitService_1 = require("../git/gitService");
 /**
  * Forward language navigation from modified-side virtual documents to the
- * corresponding workspace file. Original/base snapshots are never forwarded
- * because their line positions do not describe the target file.
+ * corresponding file in the checkout captured by the prepared DiffPlan.
+ * Original/base snapshots are never forwarded because their line positions do
+ * not describe the target file.
  */
-function registerVirtualDocLanguageFeatures(context) {
+function registerVirtualDocLanguageFeatures(context, gitService) {
     const selector = { scheme: 'git-local-review' };
     const toRealUri = (virtualUri) => {
-        const params = new URLSearchParams(virtualUri.query);
-        if (params.get('side') !== 'modified' && params.get('ref') !== 'WORKTREE') {
+        const parsed = (0, gitService_1.parseDiffDocumentUri)(virtualUri);
+        if (!parsed || parsed.side !== 'modified' || !parsed.worktreeRoot) {
             return undefined;
         }
-        const folder = vscode.workspace.workspaceFolders?.[0];
-        const filePath = virtualUri.path.startsWith('/')
-            ? virtualUri.path.slice(1)
-            : virtualUri.path;
-        if (!folder || !filePath) {
-            return undefined;
-        }
-        return vscode.Uri.joinPath(folder.uri, filePath);
+        return vscode.Uri.joinPath(vscode.Uri.file(parsed.worktreeRoot), parsed.filePath);
     };
     const ensureRealUri = async (virtualUri) => {
+        const parsed = (0, gitService_1.parseDiffDocumentUri)(virtualUri);
         const realUri = toRealUri(virtualUri);
-        if (!realUri) {
+        if (!parsed?.worktreeRoot || !realUri
+            || !await gitService.isLinkedWorktreeRoot(parsed.worktreeRoot)) {
             return undefined;
         }
         try {

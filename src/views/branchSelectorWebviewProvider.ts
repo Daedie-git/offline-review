@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { GitService } from '../git/gitService';
 import { LocalPrManager } from '../services/localPrManager';
-import { LocalPr, ReviewMode } from '../types';
+import { GitWorktreeInfo, LocalPr, ReviewMode } from '../types';
 
 interface BranchSelection {
     base: string;
@@ -12,6 +12,7 @@ interface ReviewViewState {
     review?: LocalPr;
     currentBranch?: string;
     base?: string;
+    compare?: string;
     mode?: ReviewMode;
 }
 
@@ -27,6 +28,7 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
     private mode: ReviewMode;
     private currentBranch = '';
     private branches: string[] = [];
+    private worktrees: GitWorktreeInfo[] = [];
     private stateGeneration = 0;
 
     constructor(
@@ -55,6 +57,18 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
                 case 'requestState':
                     await this.pushFullState();
                     break;
+                case 'selectWorktree':
+                    if (typeof message.root === 'string' && message.root) {
+                        try {
+                            await this.gitService.selectWorktree(message.root);
+                        } catch (error: unknown) {
+                            vscode.window.showErrorMessage(
+                                `Could not select Git worktree: ${errorMessage(error)}`
+                            );
+                        }
+                        await this.pushFullState();
+                    }
+                    break;
                 case 'selectBase':
                     if (typeof message.branch === 'string' && message.branch) {
                         this.stateGeneration++;
@@ -82,6 +96,9 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
                 case 'refreshBranches':
                     await this.postBranches();
                     break;
+                case 'refreshWorktrees':
+                    await this.postWorktrees();
+                    break;
             }
         });
         void this.extensionUri;
@@ -89,14 +106,16 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
 
     private async pushFullState(): Promise<void> {
         const generation = ++this.stateGeneration;
-        const [branches, currentBranch] = await Promise.all([
+        const [branches, currentBranch, worktrees] = await Promise.all([
             this.gitService.getBranches(true),
             this.gitService.getCurrentBranch(),
+            this.gitService.listWorktrees(),
         ]);
         if (generation !== this.stateGeneration) {
             return;
         }
         this.branches = branches;
+        this.worktrees = worktrees;
         this.currentBranch = currentBranch ?? '';
         if (!this.baseBranch || !this.branches.includes(this.baseBranch)) {
             const base = await this.defaultBase(this.branches, this.currentBranch) ?? '';
@@ -108,7 +127,10 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
                 this.localPrManager.setPreferredBaseBranch(base);
             }
         }
-        await this.view?.webview.postMessage({ type: 'branches', branches: this.branches });
+        await Promise.all([
+            this.view?.webview.postMessage({ type: 'branches', branches: this.branches }),
+            this.postWorktrees(false),
+        ]);
         if (generation === this.stateGeneration) {
             this.updateWebview();
         }
@@ -117,6 +139,33 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
     private async postBranches(): Promise<void> {
         this.branches = await this.gitService.getBranches(true);
         await this.view?.webview.postMessage({ type: 'branches', branches: this.branches });
+    }
+
+    private async postWorktrees(refresh: boolean = true): Promise<void> {
+        if (refresh) {
+            const generation = ++this.stateGeneration;
+            const worktrees = await this.gitService.listWorktrees();
+            if (generation !== this.stateGeneration) {
+                return;
+            }
+            this.worktrees = worktrees;
+        }
+        let selectedRoot = this.gitService.getSelectedWorktreeRoot();
+        if (!this.worktrees.some(worktree => worktree.root === selectedRoot)) {
+            const local = this.worktrees.find(worktree => worktree.isLocal);
+            if (local) {
+                vscode.window.showErrorMessage(
+                    `The selected Git worktree is no longer linked: ${selectedRoot}. Returning to Local.`
+                );
+                await this.gitService.selectWorktree(local.root);
+                selectedRoot = this.gitService.getSelectedWorktreeRoot();
+            }
+        }
+        await this.view?.webview.postMessage({
+            type: 'worktrees',
+            worktrees: this.worktrees,
+            selectedRoot,
+        });
     }
 
     private async defaultBase(branches: string[], current: string): Promise<string | undefined> {
@@ -141,6 +190,7 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
             compare: this.compareBranch,
             mode: this.mode,
             currentBranch: this.currentBranch,
+            selectedWorktreeRoot: this.gitService.getSelectedWorktreeRoot(),
         });
     }
 
@@ -173,6 +223,9 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
         }
         if (state.base !== undefined) {
             this.baseBranch = state.base;
+        }
+        if (state.compare !== undefined) {
+            this.compareBranch = state.compare;
         }
         if (state.mode) {
             this.mode = state.mode;
@@ -217,6 +270,8 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
     body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); padding: 8px; }
     .mode-label, .field-label { font-size: 11px; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: .04em; }
     .mode-label { margin-bottom: 6px; }
+    .worktree-field { margin-bottom: 12px; }
+    .worktree-select { width: 100%; margin-top: 4px; padding: 5px 7px; background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border, transparent); font: inherit; }
     .mode-btns { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
     .mode-btn { width: 100%; padding: 8px 10px; border: 1px solid var(--vscode-button-border, transparent); border-radius: 2px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); cursor: pointer; font-size: 12px; text-align: left; }
     .mode-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
@@ -244,6 +299,10 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
 </style>
 </head>
 <body>
+    <div class="worktree-field">
+        <div class="field-label">Git worktree</div>
+        <select class="worktree-select" id="worktreeSelect" aria-label="Git worktree"></select>
+    </div>
     <div class="mode-label">Review mode</div>
     <div class="mode-btns">
         <button class="mode-btn" id="btnUncommitted" type="button">Uncommitted<span class="sub">HEAD vs working tree</span></button>
@@ -260,7 +319,8 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
     <div class="clear-row"><button class="clear-btn" id="clearActiveBtn">Clear active</button><button class="clear-btn" id="clearAllBtn">Clear all</button></div>
 <script>
     const vscode = acquireVsCodeApi();
-    let allBranches = [], activeIndex = -1, currentValue = '', mode = 'branch', currentBranch = '';
+    let allBranches = [], allWorktrees = [], selectedWorktreeRoot = '', activeIndex = -1, currentValue = '', mode = 'branch', currentBranch = '', compareBranch = '';
+    const worktreeSelect = document.getElementById('worktreeSelect');
     const baseInput = document.getElementById('baseInput');
     const baseDropdown = document.getElementById('baseDropdown');
     const baseField = document.getElementById('baseField');
@@ -269,6 +329,11 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
     const btnActive = document.getElementById('btnActive');
     const activeSub = document.getElementById('activeSub');
     vscode.postMessage({ type: 'requestState' });
+    worktreeSelect.onfocus = () => vscode.postMessage({ type: 'refreshWorktrees' });
+    worktreeSelect.onchange = () => {
+        const root = worktreeSelect.value;
+        if (root && root !== selectedWorktreeRoot) vscode.postMessage({ type: 'selectWorktree', root });
+    };
     btnUncommitted.onclick = () => vscode.postMessage({ type: 'reviewUncommitted' });
     btnActive.onclick = () => vscode.postMessage({ type: 'reviewActiveBranch' });
     document.getElementById('clearActiveBtn').onclick = () => vscode.postMessage({ type: 'clearActiveReview' });
@@ -293,19 +358,33 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
     };
     baseDropdown.onmousedown = event => event.preventDefault();
     baseDropdown.onclick = event => { const item = event.target.closest('.dropdown-item[data-branch]'); if (item) select(item.dataset.branch); };
+    function renderWorktrees() {
+        worktreeSelect.replaceChildren(...allWorktrees.map(worktree => {
+            const option = document.createElement('option');
+            option.value = worktree.root;
+            const state = worktree.detached
+                ? 'detached @ ' + String(worktree.headCommit || '').slice(0, 8)
+                : (worktree.branch || 'unknown branch');
+            option.textContent = (worktree.isLocal ? 'Local — ' : '') + state + ' — ' + worktree.root;
+            return option;
+        }));
+        worktreeSelect.value = selectedWorktreeRoot;
+        worktreeSelect.disabled = allWorktrees.length === 0;
+    }
     function updateStatus() {
         btnUncommitted.classList.toggle('active', mode === 'uncommitted');
         btnActive.classList.toggle('active', mode === 'branch');
         baseField.classList.toggle('disabled', mode === 'uncommitted');
         activeSub.textContent = baseInput.value ? 'vs ' + baseInput.value : 'vs base';
-        if (mode === 'uncommitted') status.innerHTML = 'Active: <strong>uncommitted</strong> on <strong>' + escapeHtml(currentBranch || '?') + '</strong>. Comments are checkout-specific.';
-        else if (currentBranch && baseInput.value === currentBranch) status.innerHTML = '<strong>Primary branch self-review</strong>: intentionally empty. Use Uncommitted for working-tree changes.';
-        else status.innerHTML = 'Active: <strong>' + escapeHtml(currentBranch || '?') + '</strong> vs <strong>' + escapeHtml(baseInput.value || '?') + '</strong>. Saved branch reviews work from any checkout.';
+        if (mode === 'uncommitted') status.innerHTML = 'Active: <strong>uncommitted</strong> on <strong>' + escapeHtml(compareBranch || currentBranch || '?') + '</strong>. Comments stay with this review.';
+        else if ((compareBranch || currentBranch) && baseInput.value === (compareBranch || currentBranch)) status.innerHTML = '<strong>Primary branch self-review</strong>: intentionally empty. Use Uncommitted for working-tree changes.';
+        else status.innerHTML = 'Active: <strong>' + escapeHtml(compareBranch || currentBranch || '?') + '</strong> vs <strong>' + escapeHtml(baseInput.value || '?') + '</strong>. Saved branch reviews work from any checkout.';
     }
     window.addEventListener('message', event => {
         const msg = event.data;
         if (msg.type === 'branches') { allBranches = msg.branches || []; if (baseDropdown.classList.contains('visible')) render(); }
-        if (msg.type === 'setState') { if (msg.base !== undefined) { currentValue = msg.base || ''; baseInput.value = currentValue; } if (msg.mode) mode = msg.mode; if (msg.currentBranch !== undefined) currentBranch = msg.currentBranch; updateStatus(); }
+        if (msg.type === 'worktrees') { allWorktrees = msg.worktrees || []; selectedWorktreeRoot = msg.selectedRoot || ''; renderWorktrees(); }
+        if (msg.type === 'setState') { if (msg.base !== undefined) { currentValue = msg.base || ''; baseInput.value = currentValue; } if (msg.mode) mode = msg.mode; if (msg.currentBranch !== undefined) currentBranch = msg.currentBranch; if (msg.compare !== undefined) compareBranch = msg.compare || ''; if (msg.selectedWorktreeRoot !== undefined) { selectedWorktreeRoot = msg.selectedWorktreeRoot || ''; renderWorktrees(); } updateStatus(); }
     });
 </script>
 </body>
@@ -314,12 +393,18 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
 }
 
 interface WebviewMessage {
-    type: 'requestState' | 'selectBase' | 'reviewUncommitted' | 'reviewActiveBranch'
-        | 'clearActiveReview' | 'clearAllReviews' | 'refreshBranches';
+    type: 'requestState' | 'selectWorktree' | 'selectBase' | 'reviewUncommitted'
+        | 'reviewActiveBranch' | 'clearActiveReview' | 'clearAllReviews'
+        | 'refreshBranches' | 'refreshWorktrees';
     branch?: unknown;
+    root?: unknown;
 }
 
 function isWebviewMessage(value: unknown): value is WebviewMessage {
     return typeof value === 'object' && value !== null && 'type' in value
         && typeof (value as { type?: unknown }).type === 'string';
+}
+
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
 }

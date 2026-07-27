@@ -59,7 +59,7 @@ export declare class SectionItem extends vscode.TreeItem {
 export declare class FolderItem extends vscode.TreeItem {
     readonly folderPath: string;
     readonly children: FileChangeItem[];
-    constructor(folderPath: string, children: FileChangeItem[]);
+    constructor(folderPath: string, children: FileChangeItem[], worktreeRoot?: string);
 }
 export declare class FileChangeItem extends vscode.TreeItem {
     readonly fileChange: FileChange;

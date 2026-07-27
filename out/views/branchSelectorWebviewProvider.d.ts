@@ -10,6 +10,7 @@ interface ReviewViewState {
     review?: LocalPr;
     currentBranch?: string;
     base?: string;
+    compare?: string;
     mode?: ReviewMode;
 }
 export declare class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider {
@@ -25,11 +26,13 @@ export declare class BranchSelectorWebviewProvider implements vscode.WebviewView
     private mode;
     private currentBranch;
     private branches;
+    private worktrees;
     private stateGeneration;
     constructor(extensionUri: vscode.Uri, gitService: GitService, localPrManager: LocalPrManager);
     resolveWebviewView(webviewView: vscode.WebviewView, _context: vscode.WebviewViewResolveContext, _token: vscode.CancellationToken): void;
     private pushFullState;
     private postBranches;
+    private postWorktrees;
     private defaultBase;
     private updateWebview;
     getSourceBranch(): string;
