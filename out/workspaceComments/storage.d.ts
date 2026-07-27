@@ -1,13 +1,19 @@
 import { WorkspacePathResolver } from './pathResolver';
 import { WorkspaceComment, WorkspaceCommentsFile, WorkspaceCommentThread, WorkspaceThreadReport } from './types';
+export type WorkspaceWatchEventClassification = 'exactOwnWrite' | 'suppressed' | 'external';
 export declare class WorkspaceCommentStorage {
     private readonly pathResolver;
+    private readonly now;
+    private readonly ownWriteWindowMs;
     readonly filePath: string;
     readonly lockPath: string;
     _lastWrittenHash: string | undefined;
     private suppressWatcherUntil;
     private ignoreWatchDepth;
-    constructor(_workspaceRoot: string, pathResolver: WorkspacePathResolver);
+    private readonly ownWrites;
+    private readonly directorySyncCapabilities;
+    private readonly hardLinkCapabilities;
+    constructor(_workspaceRoot: string, pathResolver: WorkspacePathResolver, now?: () => number, ownWriteWindowMs?: number);
     load(): WorkspaceCommentsFile;
     getReports(): WorkspaceThreadReport[];
     addThread(filePath: string, startLine: number, endLine: number, sourceAnchor: string, body: string, author: string): WorkspaceCommentThread;
@@ -18,6 +24,7 @@ export declare class WorkspaceCommentStorage {
     resolveThread(threadId: string): void;
     unresolveThread(threadId: string): void;
     clear(): void;
+    classifyWatch(fsPath?: string): WorkspaceWatchEventClassification;
     shouldIgnoreWatch(fsPath?: string): boolean;
     msUntilWatchAllowed(): number;
     private setThreadState;
@@ -30,6 +37,7 @@ export declare class WorkspaceCommentStorage {
     private deleteExpected;
     private displaceAndVerify;
     private assertExpectedFingerprint;
+    private hasSafelyAbsentStorageDirectory;
     private ensureSafeStorageDirectory;
     private openVerifiedDirectory;
     private revalidateStorage;
@@ -38,7 +46,8 @@ export declare class WorkspaceCommentStorage {
     private entryPath;
     private guardedOperation;
     private guardedUnlink;
+    private preflightDirectorySync;
+    private preflightHardLinks;
     private markOwnWrite;
-    private readAnchor;
 }
 export declare function isWorkspaceCommentsFile(value: unknown, pathResolver: WorkspacePathResolver): value is WorkspaceCommentsFile;

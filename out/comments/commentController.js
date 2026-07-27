@@ -35,12 +35,14 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ReviewCommentController = void 0;
 const vscode = __importStar(require("vscode"));
-const os = __importStar(require("os"));
-const types_1 = require("../types");
+const authorIdentity_1 = require("../authorIdentity");
 const gitService_1 = require("../git/gitService");
+const reviewAnchorResolver_1 = require("./reviewAnchorResolver");
 class ReviewCommentController {
-    constructor(storageService) {
+    constructor(storageService, anchorResolver, authorIdentity = new authorIdentity_1.AuthorIdentity()) {
         this.storageService = storageService;
+        this.anchorResolver = anchorResolver;
+        this.authorIdentity = authorIdentity;
         this.threads = new Map();
         this.commentIdentities = new WeakMap();
         this.reviewableFiles = new Set();
@@ -99,61 +101,86 @@ class ReviewCommentController {
             }
             this.activePlan = plan;
         }
-        const comments = plan
-            ? this.storageService.loadCommentsForReview(plan.reviewId)
-            : this.storageService.loadComments();
-        if (!comments) {
+        if (!plan) {
             return;
         }
-        for (const thread of comments.threads) {
-            if (!plan
-                || !(0, types_1.isThreadCurrentForPlan)(thread, plan, filePath, this.originalSideFiles.has(filePath) ? 'original' : 'modified')
-                || threadTargetUri(thread.target, plan).toString() !== targetUri.toString()) {
+        const state = this.anchorResolver?.getAppliedState(plan);
+        if (!state) {
+            return;
+        }
+        for (const projection of state.projections) {
+            if (!(0, reviewAnchorResolver_1.isEffectiveReviewProjection)(projection)
+                || projection.thread.filePath !== filePath
+                || projection.currentPlanUri !== targetUri.toString()) {
                 continue;
             }
-            const key = targetUri.scheme === 'file'
-                ? thread.id
-                : threadKey(thread.id, targetUri);
-            this.createVscodeThread(plan.reviewId, targetUri, thread, key);
+            const key = threadKey(projection.thread.id, targetUri);
+            this.createVscodeThread(plan.reviewId, targetUri, projection, key);
         }
     }
     /**
      * Replace all loaded threads using the exact target document in a prepared
      * plan. No branch equality or checked-out-branch inference is performed.
      */
-    loadAllThreads(plan) {
+    loadAllThreads(plan, preparedState) {
         this.clearAllThreads();
         this.activePlan = plan;
         if (!plan) {
             return;
         }
-        const comments = this.storageService.loadCommentsForReview(plan.reviewId);
-        if (!comments || comments.threads.length === 0) {
+        const state = preparedState ?? this.anchorResolver?.getAppliedState(plan);
+        if (!state
+            || state.plan.reviewId !== plan.reviewId
+            || (this.anchorResolver
+                && this.anchorResolver.getAppliedState(plan) !== state)) {
             return;
         }
-        for (const thread of comments.threads) {
-            const target = thread.target;
-            const targetUri = threadTargetUri(target, plan);
-            this.createVscodeThread(plan.reviewId, targetUri, thread, threadKey(thread.id, targetUri));
+        for (const projection of state.projections) {
+            if (!(0, reviewAnchorResolver_1.isEffectiveReviewProjection)(projection)
+                || projection.effectiveStartLine === undefined
+                || projection.effectiveEndLine === undefined
+                || !projection.currentPlanUri) {
+                continue;
+            }
+            const targetUri = vscode.Uri.parse(projection.currentPlanUri);
+            this.createVscodeThread(plan.reviewId, targetUri, projection, threadKey(projection.thread.id, targetUri));
         }
     }
     /** Capture ownership before opening any delayed new-comment UI. */
     captureNewThreadReviewId(uri, filePath) {
         return this.requireCurrentCommentTarget(uri, filePath).reviewId;
     }
-    createThread(uri, range, text, filePath, existingThread, expectedReviewId) {
+    async createThread(uri, range, text, filePath, existingThread, expectedReviewId, capturedDocument) {
         const plan = this.requireCurrentCommentTarget(uri, filePath);
         if (expectedReviewId && plan.reviewId !== expectedReviewId) {
             throw new Error('The active review changed before the comment was submitted');
         }
-        const target = targetFromPlan(plan, filePath, this.originalSideFiles.has(filePath) ? 'original' : 'modified');
-        const savedThread = this.storageService.addThread(plan.reviewId, target, filePath, range.start.line, range.end.line, text, os.userInfo().username);
-        const key = uri.scheme === 'file' ? savedThread.id : threadKey(savedThread.id, uri);
+        const side = this.originalSideFiles.has(filePath) ? 'original' : 'modified';
+        const target = targetFromPlan(plan, filePath, side);
+        const document = capturedDocument
+            ?? findOpenDocument(uri)
+            ?? await vscode.workspace.openTextDocument(uri);
+        const currentPlan = this.requireCurrentCommentTarget(uri, filePath);
+        if (currentPlan !== plan
+            || (expectedReviewId && currentPlan.reviewId !== expectedReviewId)
+            || document.uri.toString() !== uri.toString()) {
+            throw new Error('The active review changed before the comment was submitted');
+        }
+        if (range.start.line < 0 || range.end.line < range.start.line
+            || range.end.line >= document.lineCount) {
+            throw new Error('The selected review comment range is no longer valid');
+        }
+        const sourceAnchor = anchorFromDocument(document, range.start.line, range.end.line);
+        const savedThread = this.storageService.addThread(plan.reviewId, target, filePath, range.start.line, range.end.line, text, this.authorIdentity.get(), sourceAnchor);
+        const projection = projectionForNewThread(plan, savedThread, uri, side);
+        this.anchorResolver?.addCurrentProjection(plan, projection);
+        const key = threadKey(savedThread.id, uri);
         if (existingThread) {
             this.populateThread(existingThread, plan.reviewId, savedThread, key);
+            existingThread.range = new vscode.Range(range.start.line, 0, range.end.line, 0);
         }
         else {
-            this.createVscodeThread(plan.reviewId, uri, savedThread, key);
+            this.createVscodeThread(plan.reviewId, uri, projection, key);
         }
     }
     requireCurrentCommentTarget(uri, filePath) {
@@ -187,10 +214,17 @@ class ReviewCommentController {
         };
         this.threads.set(key, thread);
     }
-    createVscodeThread(reviewId, uri, savedThread, key = savedThread.id) {
+    createVscodeThread(reviewId, uri, projection, key = projection.thread.id) {
+        const savedThread = projection.thread;
+        const startLine = projection.effectiveStartLine;
+        const endLine = projection.effectiveEndLine;
+        if (startLine === undefined || endLine === undefined) {
+            throw new Error('Cannot render a review comment without an effective range');
+        }
         const existing = this.threads.get(key);
         if (existing) {
             existing.comments = this.toVscodeComments(reviewId, savedThread);
+            existing.range = new vscode.Range(startLine, 0, endLine, 0);
             this.applyThreadState(existing, savedThread);
             existing.__threadData = {
                 reviewId,
@@ -201,7 +235,7 @@ class ReviewCommentController {
             return existing;
         }
         this.removeOtherUris(savedThread.id, key);
-        const range = new vscode.Range(savedThread.startLine, 0, savedThread.endLine, 0);
+        const range = new vscode.Range(startLine, 0, endLine, 0);
         const thread = this.controller.createCommentThread(uri, range, []);
         thread.comments = this.toVscodeComments(reviewId, savedThread);
         thread.canReply = true;
@@ -257,6 +291,7 @@ class ReviewCommentController {
             return;
         }
         if (this.storageService.resolveThread(managed.__threadData.reviewId, managed.__threadData.threadId)) {
+            this.anchorResolver?.updateThread(managed.__threadData.reviewId, managed.__threadData.threadId, saved => ({ ...saved, state: 'resolved' }));
             thread.state = vscode.CommentThreadState.Resolved;
             thread.label = 'Resolved';
             thread.contextValue = 'resolved';
@@ -268,6 +303,7 @@ class ReviewCommentController {
             return;
         }
         if (this.storageService.unresolveThread(managed.__threadData.reviewId, managed.__threadData.threadId)) {
+            this.anchorResolver?.updateThread(managed.__threadData.reviewId, managed.__threadData.threadId, saved => ({ ...saved, state: 'unresolved' }));
             thread.state = vscode.CommentThreadState.Unresolved;
             thread.label = undefined;
             thread.contextValue = 'unresolved';
@@ -278,8 +314,9 @@ class ReviewCommentController {
         if (!managed.__threadData) {
             return;
         }
-        const comment = this.storageService.addReplyToThread(managed.__threadData.reviewId, managed.__threadData.threadId, text, os.userInfo().username);
+        const comment = this.storageService.addReplyToThread(managed.__threadData.reviewId, managed.__threadData.threadId, text, this.authorIdentity.get());
         if (comment) {
+            this.anchorResolver?.updateThread(managed.__threadData.reviewId, managed.__threadData.threadId, saved => ({ ...saved, comments: [...saved.comments, comment] }));
             thread.comments = [
                 ...thread.comments,
                 this.toVscodeComment(managed.__threadData.reviewId, managed.__threadData.threadId, comment),
@@ -303,6 +340,7 @@ class ReviewCommentController {
             .loadCommentsForReview(identity.reviewId)?.threads
             .find(candidate => candidate.id === identity.threadId);
         if (refreshed) {
+            this.anchorResolver?.updateThread(identity.reviewId, identity.threadId, () => refreshed);
             thread.comments = this.toVscodeComments(identity.reviewId, refreshed);
         }
     }
@@ -328,12 +366,16 @@ class ReviewCommentController {
             return;
         }
         if (removingLast) {
+            this.anchorResolver?.updateThread(identity.reviewId, identity.threadId, () => undefined);
             this.disposeThread(managed);
             return;
         }
         const refreshed = this.storageService
             .loadCommentsForReview(identity.reviewId)?.threads
             .find(candidate => candidate.id === identity.threadId);
+        if (refreshed) {
+            this.anchorResolver?.updateThread(identity.reviewId, identity.threadId, () => refreshed);
+        }
         thread.comments = refreshed
             ? this.toVscodeComments(identity.reviewId, refreshed)
             : thread.comments.filter(candidate => candidate !== comment);
@@ -393,6 +435,10 @@ exports.ReviewCommentController = ReviewCommentController;
 function threadKey(threadId, uri) {
     return `${threadId}::${uri.toString()}`;
 }
+function findOpenDocument(uri) {
+    const target = uri.toString();
+    return vscode.workspace.textDocuments.find(document => document.uri.toString() === target);
+}
 function uriFilePath(uri) {
     return uri.path.startsWith('/') ? uri.path.slice(1) : uri.path;
 }
@@ -418,24 +464,23 @@ function targetFromPlan(plan, filePath, side) {
             filePath,
         };
 }
-function threadTargetUri(target, plan) {
-    const currentWorktreeTarget = target.kind === 'worktree'
-        && plan.kind === 'worktree'
-        && target.reviewId === plan.reviewId
-        && target.headCommit === plan.headCommit;
-    const document = target.kind === 'git'
-        ? { kind: 'git', ref: target.ref }
-        : {
-            kind: 'worktree',
-            reviewId: plan.reviewId,
-            headCommit: target.headCommit,
-            // The URI nonce changes on refresh to invalidate VS Code's cache,
-            // while same-HEAD comments remain attached to the current document.
-            planId: currentWorktreeTarget ? plan.planId : target.planId,
-            // The persisted schema intentionally remains unchanged. During this
-            // activation, thread documents use the prepared checkout identity.
-            worktreeRoot: plan.worktreeRoot,
-        };
-    return (0, gitService_1.getDiffDocumentUri)(document, target.filePath, target.kind === 'git' ? target.side ?? 'modified' : 'modified', plan.reviewId, plan.worktreeRoot);
+function projectionForNewThread(plan, thread, uri, side) {
+    return {
+        reviewId: plan.reviewId,
+        thread,
+        side,
+        anchorStatus: 'current',
+        effectiveStartLine: thread.startLine,
+        effectiveEndLine: thread.endLine,
+        matches: [{ startLine: thread.startLine, endLine: thread.endLine }],
+        currentPlanUri: uri.toString(),
+    };
+}
+function anchorFromDocument(document, startLine, endLine) {
+    const lines = [];
+    for (let line = startLine; line <= endLine; line++) {
+        lines.push(document.lineAt(line).text);
+    }
+    return lines.join('\n');
 }
 //# sourceMappingURL=commentController.js.map

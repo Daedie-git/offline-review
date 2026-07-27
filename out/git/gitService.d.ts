@@ -4,6 +4,12 @@ export interface FileDiffUris {
     readonly left: vscode.Uri;
     readonly right: vscode.Uri;
 }
+export type GitFileContentResult = {
+    readonly status: 'available';
+    readonly content: string;
+} | {
+    readonly status: 'unavailable';
+};
 /** A checkout identity transition, including entering or leaving detached HEAD. */
 export interface GitCheckoutChange {
     readonly previousBranch: string | undefined;
@@ -84,12 +90,14 @@ export declare class GitService {
     getWorkingTreeFileUri(plan: WorktreeDiffPlan, filePath: string): vscode.Uri;
     getFileDiffUris(plan: DiffPlan, change: FileChange): FileDiffUris;
     getFileContent(document: DiffDocument, filePath: string): Promise<string>;
+    /** Read content while preserving the distinction between an empty blob and failure. */
+    getFileContentResult(document: DiffDocument, filePath: string): Promise<GitFileContentResult>;
     getCommitsForDiff(plan: DiffPlan): Promise<CommitInfo[]>;
     /** Both arguments must be immutable commit hashes. */
     getCommitsBetween(sourceCommit: string, targetCommit: string, worktreeRoot?: string): Promise<CommitInfo[]>;
     private resolveCommitWithFallback;
     private resolveCommit;
-    private getWorkingTreeFileContent;
+    private getWorkingTreeFileContentResult;
     private assertValidPlan;
     private execGit;
 }

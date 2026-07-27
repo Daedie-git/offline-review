@@ -36,10 +36,11 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.ReviewFileDecorationProvider = void 0;
 const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
+const reviewAnchorResolver_1 = require("../comments/reviewAnchorResolver");
 class ReviewFileDecorationProvider {
-    constructor(storageService, gitService) {
-        this.storageService = storageService;
+    constructor(_storageService, gitService, anchorResolver) {
         this.gitService = gitService;
+        this.anchorResolver = anchorResolver;
         this._onDidChangeFileDecorations = new vscode.EventEmitter();
         this.onDidChangeFileDecorations = this._onDidChangeFileDecorations.event;
     }
@@ -69,11 +70,13 @@ class ReviewFileDecorationProvider {
         };
     }
     getUnresolvedCount(filePath) {
-        const comments = this.storageService.loadComments();
-        if (!comments) {
+        const state = this.anchorResolver?.getAppliedState();
+        if (!state || state.plan.worktreeRoot !== this.gitService.getSelectedWorktreeRoot()) {
             return 0;
         }
-        return comments.threads.filter(t => t.filePath === filePath && t.state === 'unresolved').length;
+        return state.projections.filter(projection => projection.thread.filePath === filePath
+            && projection.thread.state === 'unresolved'
+            && (0, reviewAnchorResolver_1.isEffectiveReviewProjection)(projection)).length;
     }
     refresh() {
         this._onDidChangeFileDecorations.fire(undefined);

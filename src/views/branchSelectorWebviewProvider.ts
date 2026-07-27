@@ -87,12 +87,6 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
                 case 'reviewActiveBranch':
                     await vscode.commands.executeCommand('localPrReview.reviewActiveBranch');
                     break;
-                case 'clearActiveReview':
-                    await vscode.commands.executeCommand('localPrReview.clearActiveReview');
-                    break;
-                case 'clearAllReviews':
-                    await vscode.commands.executeCommand('localPrReview.clearAllReviews');
-                    break;
                 case 'refreshBranches':
                     await this.postBranches();
                     break;
@@ -291,9 +285,6 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
     .remote-tag { margin-left: 6px; font-size: 10px; opacity: .7; }
     .status { margin-top: 10px; font-size: 11px; color: var(--vscode-descriptionForeground); line-height: 1.4; }
     .status strong { color: var(--vscode-foreground); font-weight: 600; }
-    .clear-row { display: flex; gap: 6px; margin-top: 12px; }
-    .clear-btn { flex: 1; padding: 5px 6px; border: 1px solid var(--vscode-button-border, transparent); background: transparent; color: var(--vscode-descriptionForeground); cursor: pointer; font-size: 11px; }
-    .clear-btn:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-errorForeground, #f14c4c); }
     .base-field.disabled { opacity: .45; pointer-events: none; }
     .no-results { padding: 6px 8px; color: var(--vscode-descriptionForeground); font-style: italic; font-size: 12px; }
 </style>
@@ -316,7 +307,6 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
         </div>
     </div>
     <div class="status" id="status"></div>
-    <div class="clear-row"><button class="clear-btn" id="clearActiveBtn">Clear active</button><button class="clear-btn" id="clearAllBtn">Clear all</button></div>
 <script>
     const vscode = acquireVsCodeApi();
     let allBranches = [], allWorktrees = [], selectedWorktreeRoot = '', activeIndex = -1, currentValue = '', mode = 'branch', currentBranch = '', compareBranch = '';
@@ -336,8 +326,6 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
     };
     btnUncommitted.onclick = () => vscode.postMessage({ type: 'reviewUncommitted' });
     btnActive.onclick = () => vscode.postMessage({ type: 'reviewActiveBranch' });
-    document.getElementById('clearActiveBtn').onclick = () => vscode.postMessage({ type: 'clearActiveReview' });
-    document.getElementById('clearAllBtn').onclick = () => vscode.postMessage({ type: 'clearAllReviews' });
     const escapeHtml = value => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     const filtered = query => { const q = query.toLowerCase(); return allBranches.filter(branch => !q || branch.toLowerCase().includes(q)).slice(0, 50); };
     function render() {
@@ -394,8 +382,7 @@ export class BranchSelectorWebviewProvider implements vscode.WebviewViewProvider
 
 interface WebviewMessage {
     type: 'requestState' | 'selectWorktree' | 'selectBase' | 'reviewUncommitted'
-        | 'reviewActiveBranch' | 'clearActiveReview' | 'clearAllReviews'
-        | 'refreshBranches' | 'refreshWorktrees';
+        | 'reviewActiveBranch' | 'refreshBranches' | 'refreshWorktrees';
     branch?: unknown;
     root?: unknown;
 }

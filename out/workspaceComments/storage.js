@@ -39,14 +39,21 @@ const crypto = __importStar(require("crypto"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const util_1 = require("util");
+const lineSequenceResolver_1 = require("../lineSequenceResolver");
 const fileLock_1 = require("./fileLock");
 const safeFilesystem_1 = require("./safeFilesystem");
 const ABSENT_FINGERPRINT = 'absent';
+const DEFAULT_OWN_WRITE_WINDOW_MS = 300;
 class WorkspaceCommentStorage {
-    constructor(_workspaceRoot, pathResolver) {
+    constructor(_workspaceRoot, pathResolver, now = () => Date.now(), ownWriteWindowMs = DEFAULT_OWN_WRITE_WINDOW_MS) {
         this.pathResolver = pathResolver;
+        this.now = now;
+        this.ownWriteWindowMs = ownWriteWindowMs;
         this.suppressWatcherUntil = 0;
         this.ignoreWatchDepth = 0;
+        this.ownWrites = new Map();
+        this.directorySyncCapabilities = new Set();
+        this.hardLinkCapabilities = new Set();
         const directory = path.join(pathResolver.canonicalRoot, '.vscode', 'local-reviews');
         this.filePath = path.join(directory, 'workspace-comments.json');
         this.lockPath = path.join(directory, '.workspace-comments.lock');
@@ -55,17 +62,52 @@ class WorkspaceCommentStorage {
         return this.loadSnapshot(false).comments;
     }
     getReports() {
+        const contentByPath = new Map();
         return this.load().threads.map(thread => {
             const pathStatus = this.pathResolver.inspectStoredPath(thread.filePath);
-            const anchor = pathStatus === 'current' ? this.readAnchor(thread) : undefined;
-            const rangeStatus = pathStatus !== 'current'
-                ? 'unavailable'
-                : anchor === undefined ? 'outOfRange'
-                    : anchor === thread.sourceAnchor ? 'current' : 'stale';
+            if (pathStatus !== 'current') {
+                return {
+                    ...thread,
+                    pathStatus,
+                    anchorStatus: 'unavailable',
+                    rangeStatus: 'unavailable',
+                    matches: [],
+                    stale: false,
+                };
+            }
+            let content = contentByPath.get(thread.filePath);
+            if (!contentByPath.has(thread.filePath)) {
+                const uri = this.pathResolver.uriForStoredPath(thread.filePath);
+                try {
+                    content = uri ? fs.readFileSync(uri.fsPath, 'utf8') : undefined;
+                }
+                catch {
+                    content = undefined;
+                }
+                contentByPath.set(thread.filePath, content);
+            }
+            if (content === undefined) {
+                return {
+                    ...thread,
+                    pathStatus,
+                    anchorStatus: 'unavailable',
+                    rangeStatus: 'unavailable',
+                    matches: [],
+                    stale: false,
+                };
+            }
+            const resolution = (0, lineSequenceResolver_1.resolveExactLineSequence)(content, thread.sourceAnchor, thread.startLine, thread.endLine);
+            const rangeStatus = resolution.status === 'notFound'
+                ? 'stale'
+                : resolution.status;
             return {
                 ...thread,
                 pathStatus,
+                anchorStatus: resolution.status,
                 rangeStatus,
+                effectiveStartLine: resolution.effectiveStartLine,
+                effectiveEndLine: resolution.effectiveEndLine,
+                matches: resolution.matches,
                 stale: rangeStatus === 'stale',
             };
         });
@@ -146,24 +188,40 @@ class WorkspaceCommentStorage {
             comments.threads = [];
         });
     }
-    shouldIgnoreWatch(fsPath) {
-        if (this.ignoreWatchDepth > 0) {
-            return true;
-        }
-        if (fsPath && this._lastWrittenHash && fs.existsSync(fsPath)) {
-            try {
-                if (hash(fs.readFileSync(fsPath)) === this._lastWrittenHash) {
-                    return true;
+    classifyWatch(fsPath) {
+        const now = this.now();
+        const ownWrite = fsPath ? this.ownWrites.get(fsPath) : undefined;
+        if (fsPath && ownWrite) {
+            if (now >= ownWrite.expiresAt) {
+                this.ownWrites.delete(fsPath);
+            }
+            else {
+                try {
+                    if (ownWrite.expectedHash === undefined) {
+                        if (!fs.existsSync(fsPath)) {
+                            return 'exactOwnWrite';
+                        }
+                    }
+                    else if (fs.existsSync(fsPath)
+                        && hash(fs.readFileSync(fsPath)) === ownWrite.expectedHash) {
+                        return 'exactOwnWrite';
+                    }
+                }
+                catch {
+                    // An unreadable or changing path is never an exact own write.
                 }
             }
-            catch {
-                // Fall through to the short suppression window.
-            }
         }
-        return Date.now() < this.suppressWatcherUntil;
+        if (this.ignoreWatchDepth > 0 || now < this.suppressWatcherUntil) {
+            return 'suppressed';
+        }
+        return 'external';
+    }
+    shouldIgnoreWatch(fsPath) {
+        return this.classifyWatch(fsPath) !== 'external';
     }
     msUntilWatchAllowed() {
-        return Math.max(0, this.suppressWatcherUntil - Date.now());
+        return Math.max(0, this.suppressWatcherUntil - this.now());
     }
     setThreadState(threadId, state) {
         this.mutate(comments => {
@@ -173,7 +231,7 @@ class WorkspaceCommentStorage {
     mutate(mutation) {
         const directory = this.ensureSafeStorageDirectory();
         try {
-            syncDirectoryStrict(directory);
+            this.preflightDirectorySync(directory);
             return (0, fileLock_1.withFileLock)(this.entryPath(directory, path.basename(this.lockPath)), () => {
                 this.verifyStorageDirectory(directory);
                 const snapshot = this.loadSnapshot(true, directory);
@@ -187,6 +245,12 @@ class WorkspaceCommentStorage {
         }
     }
     loadSnapshot(lockHeld, heldDirectory) {
+        if (!heldDirectory && this.hasSafelyAbsentStorageDirectory()) {
+            return {
+                comments: { version: 1, threads: [] },
+                fingerprint: ABSENT_FINGERPRINT,
+            };
+        }
         const directory = heldDirectory ?? this.ensureSafeStorageDirectory();
         try {
             this.revalidateStorage(directory);
@@ -341,7 +405,7 @@ class WorkspaceCommentStorage {
         let temporaryCreated = false;
         let temporaryDurable = false;
         let recoveryEntriesRetired = false;
-        preflightHardLinks(directory, () => this.verifyStorageDirectory(directory));
+        this.preflightHardLinks(directory);
         try {
             descriptor = this.guardedOperation(directory, () => fs.openSync(temporaryPath, 'wx', 0o600));
             temporaryCreated = true;
@@ -401,7 +465,7 @@ class WorkspaceCommentStorage {
             this.assertExpectedFingerprint(expectedFingerprint, directory);
             return;
         }
-        preflightHardLinks(directory, () => this.verifyStorageDirectory(directory));
+        this.preflightHardLinks(directory);
         const backupPath = this.displaceAndVerify(expectedFingerprint, directory);
         syncDirectoryStrict(directory);
         this.guardedUnlink(backupPath, directory);
@@ -443,6 +507,24 @@ class WorkspaceCommentStorage {
         if (actual !== expected) {
             throw changedOutsideLockError();
         }
+    }
+    hasSafelyAbsentStorageDirectory() {
+        let current = this.pathResolver.canonicalRoot;
+        for (const component of ['.vscode', 'local-reviews']) {
+            const next = path.join(current, component);
+            if (!pathEntryExists(next)) {
+                return true;
+            }
+            const entry = fs.lstatSync(next);
+            if (entry.isSymbolicLink() || !entry.isDirectory()) {
+                throw new Error(`Unsafe workspace comments directory: ${next}`);
+            }
+            if (!(0, safeFilesystem_1.sameCanonicalPath)((0, safeFilesystem_1.canonicalPath)(next), next)) {
+                throw new Error(`Unsafe workspace comments directory alias: ${next}`);
+            }
+            current = next;
+        }
+        return false;
     }
     ensureSafeStorageDirectory() {
         let current = this.pathResolver.canonicalRoot;
@@ -569,29 +651,34 @@ class WorkspaceCommentStorage {
     guardedUnlink(filePath, directory) {
         this.guardedOperation(directory, () => fs.unlinkSync(filePath));
     }
+    preflightDirectorySync(directory) {
+        const identity = directoryIdentity(directory);
+        if (this.directorySyncCapabilities.has(identity)) {
+            return;
+        }
+        syncDirectoryStrict(directory);
+        this.directorySyncCapabilities.add(identity);
+    }
+    preflightHardLinks(directory) {
+        const identity = directoryIdentity(directory);
+        if (this.hardLinkCapabilities.has(identity)) {
+            return;
+        }
+        preflightHardLinks(directory, () => this.verifyStorageDirectory(directory));
+        this.hardLinkCapabilities.add(identity);
+    }
     markOwnWrite(serialized) {
         this._lastWrittenHash = hash(Buffer.from(serialized));
-        this.suppressWatcherUntil = Date.now() + 300;
+        const deadline = this.now() + this.ownWriteWindowMs;
+        this.ownWrites.set(this.filePath, {
+            expectedHash: serialized === '' ? undefined : this._lastWrittenHash,
+            expiresAt: deadline,
+        });
+        this.suppressWatcherUntil = Math.max(this.suppressWatcherUntil, deadline);
         this.ignoreWatchDepth++;
         setTimeout(() => {
             this.ignoreWatchDepth = Math.max(0, this.ignoreWatchDepth - 1);
         }, 0);
-    }
-    readAnchor(thread) {
-        const uri = this.pathResolver.uriForStoredPath(thread.filePath);
-        if (!uri) {
-            return undefined;
-        }
-        try {
-            const lines = fs.readFileSync(uri.fsPath, 'utf8').split(/\r?\n/);
-            if (thread.startLine >= lines.length || thread.endLine >= lines.length) {
-                return undefined;
-            }
-            return lines.slice(thread.startLine, thread.endLine + 1).join('\n');
-        }
-        catch {
-            return undefined;
-        }
     }
 }
 exports.WorkspaceCommentStorage = WorkspaceCommentStorage;
@@ -686,6 +773,11 @@ function matchesCapturedDirectory(stat, directory) {
         return stat.dev === directory.dev && stat.ino === directory.ino;
     }
     return stat.ctimeMs === directory.ctimeMs && stat.birthtimeMs === directory.birthtimeMs;
+}
+function directoryIdentity(directory) {
+    return directory.dev !== 0 && directory.ino !== 0
+        ? `${directory.dev}:${directory.ino}`
+        : `${directory.ctimeMs}:${directory.birthtimeMs}`;
 }
 function directoryPathHasIdentity(directoryPath, expected) {
     try {

@@ -34,16 +34,17 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.WorkspaceCommentController = void 0;
-const os = __importStar(require("os"));
 const vscode = __importStar(require("vscode"));
+const authorIdentity_1 = require("../authorIdentity");
 class WorkspaceCommentController {
-    constructor(storage, pathResolver) {
+    constructor(storage, pathResolver, authorIdentity = new authorIdentity_1.AuthorIdentity()) {
         this.storage = storage;
         this.pathResolver = pathResolver;
+        this.authorIdentity = authorIdentity;
         this.threads = new Map();
         this.commentIdentities = new WeakMap();
         this.controller = vscode.comments.createCommentController('localCodeComments', 'Offline Review Code Comments');
-        this.controller.commentingRangeProvider = {
+        this.commentingRangeProvider = {
             provideCommentingRanges: (document) => {
                 if (!this.pathResolver.resolveUri(document.uri)) {
                     return [];
@@ -52,16 +53,26 @@ class WorkspaceCommentController {
                 return [new vscode.Range(0, 0, lastLine, document.lineAt(lastLine).range.end.character)];
             },
         };
+        this.controller.commentingRangeProvider = this.commentingRangeProvider;
         this.controller.options = {
             prompt: 'Add workspace code comment',
             placeHolder: 'Comment on this workspace code',
         };
     }
+    /**
+     * Republishes the provider so hosts recompute commentable ranges for the
+     * current editor. Cursor can otherwise retain an empty range cache after
+     * activation or a same-version extension reload.
+     */
+    refreshCommentingRanges() {
+        this.controller.commentingRangeProvider = this.commentingRangeProvider;
+    }
     loadAllThreads() {
         const retained = new Set();
         for (const saved of this.storage.getReports()) {
             const uri = this.pathResolver.uriForStoredPath(saved.filePath);
-            if (!uri || saved.rangeStatus === 'outOfRange') {
+            if (!uri
+                || (saved.anchorStatus !== 'current' && saved.anchorStatus !== 'reanchored')) {
                 continue;
             }
             retained.add(saved.id);
@@ -85,17 +96,26 @@ class WorkspaceCommentController {
             throw new Error('The selected code comment range is no longer valid');
         }
         const sourceAnchor = anchorFromDocument(document, startLine, endLine);
-        const saved = this.storage.addThread(resolved.filePath, startLine, endLine, sourceAnchor, body, os.userInfo().username);
+        const saved = this.storage.addThread(resolved.filePath, startLine, endLine, sourceAnchor, body, this.authorIdentity.get());
         if (existingThread) {
             this.populateThread(existingThread, saved);
         }
         else {
-            this.createOrUpdateThread(resolved.uri, saved);
+            this.createOrUpdateThread(resolved.uri, {
+                ...saved,
+                pathStatus: 'current',
+                anchorStatus: 'current',
+                rangeStatus: 'current',
+                effectiveStartLine: startLine,
+                effectiveEndLine: endLine,
+                matches: [{ startLine, endLine }],
+                stale: false,
+            });
         }
     }
     addReply(thread, body) {
         const threadId = this.requireThreadId(thread);
-        const comment = this.storage.addReply(threadId, body, os.userInfo().username);
+        const comment = this.storage.addReply(threadId, body, this.authorIdentity.get());
         thread.comments = [...thread.comments, this.toVscodeComment(threadId, comment)];
     }
     resolveThread(thread) {
@@ -139,6 +159,11 @@ class WorkspaceCommentController {
         this.controller.dispose();
     }
     createOrUpdateThread(uri, saved) {
+        const startLine = saved.effectiveStartLine;
+        const endLine = saved.effectiveEndLine;
+        if (startLine === undefined || endLine === undefined) {
+            return;
+        }
         let existing = this.threads.get(saved.id);
         if (existing && existing.uri.fsPath !== uri.fsPath) {
             existing.dispose();
@@ -147,11 +172,11 @@ class WorkspaceCommentController {
         }
         if (existing) {
             existing.comments = this.toVscodeComments(saved);
-            existing.range = new vscode.Range(saved.startLine, 0, saved.endLine, 0);
+            existing.range = new vscode.Range(startLine, 0, endLine, 0);
             this.applyState(existing, saved);
             return;
         }
-        const thread = this.controller.createCommentThread(uri, new vscode.Range(saved.startLine, 0, saved.endLine, 0), []);
+        const thread = this.controller.createCommentThread(uri, new vscode.Range(startLine, 0, endLine, 0), []);
         this.populateThread(thread, saved);
     }
     populateThread(thread, saved) {

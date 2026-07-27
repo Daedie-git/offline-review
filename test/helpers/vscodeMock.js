@@ -132,6 +132,16 @@ class ThemeColor {
 const createdCommentThreads = [];
 const createdCommentControllers = [];
 
+async function defaultOpenTextDocument(uri) {
+    return {
+        uri,
+        lineCount: 100,
+        lineAt() {
+            return { text: '', range: { end: { character: 0 } } };
+        },
+    };
+}
+
 const vscode = {
     Disposable,
     EventEmitter,
@@ -152,17 +162,26 @@ const vscode = {
     workspace: {
         workspaceFolders: [],
         textDocuments: [],
+        openTextDocument: defaultOpenTextDocument,
         asRelativePath(uri) {
             return uri.fsPath;
         },
     },
     comments: {
         createCommentController(id, label) {
+            let commentingRangeProvider;
             const controller = {
                 id,
                 label,
                 options: undefined,
-                commentingRangeProvider: undefined,
+                commentingRangeProviderAssignments: 0,
+                get commentingRangeProvider() {
+                    return commentingRangeProvider;
+                },
+                set commentingRangeProvider(value) {
+                    commentingRangeProvider = value;
+                    this.commentingRangeProviderAssignments++;
+                },
                 createCommentThread(uri, range, comments) {
                     const thread = {
                         uri,
@@ -204,6 +223,7 @@ function installVscodeMock(workspaceRoot) {
         ? [{ uri: Uri.file(workspaceRoot) }]
         : [];
     vscode.workspace.textDocuments = [];
+    vscode.workspace.openTextDocument = defaultOpenTextDocument;
     createdCommentThreads.length = 0;
     createdCommentControllers.length = 0;
     if (!installed) {

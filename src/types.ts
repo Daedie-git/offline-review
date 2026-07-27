@@ -176,8 +176,40 @@ export interface ReviewThread {
     endLine: number;
     state: 'resolved' | 'unresolved';
     comments: ReviewComment[];
+    /** Exact normalized selected lines; optional for existing v2 files. */
+    sourceAnchor?: string;
     /** Snapshot/path identity captured when the thread was first persisted. */
     target: ReviewThreadTarget;
+}
+
+export type ReviewAnchorStatus =
+    | 'current'
+    | 'reanchored'
+    | 'legacyCurrent'
+    | 'notFound'
+    | 'ambiguous'
+    | 'unavailable';
+
+export interface ReviewAnchorMatch {
+    readonly startLine: number;
+    readonly endLine: number;
+}
+
+export interface ReviewThreadProjection {
+    readonly reviewId: string;
+    readonly thread: ReviewThread;
+    readonly side: 'original' | 'modified';
+    readonly anchorStatus: ReviewAnchorStatus;
+    readonly effectiveStartLine?: number;
+    readonly effectiveEndLine?: number;
+    readonly matches: readonly ReviewAnchorMatch[];
+    readonly currentPlanUri?: string;
+    readonly historicalGitUri?: string;
+}
+
+export interface PreparedReviewCommentState {
+    readonly plan: DiffPlan;
+    readonly projections: readonly ReviewThreadProjection[];
 }
 
 export interface ReviewComment {

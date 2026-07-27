@@ -13,6 +13,16 @@ import {
 } from '../types';
 import { LocalPrManager } from '../services/localPrManager';
 
+export type WatchEventClassification = 'exactOwnWrite' | 'suppressed' | 'external';
+
+interface OwnWriteRecord {
+    /** Undefined means this write intentionally removed the path. */
+    readonly expectedHash: string | undefined;
+    readonly expiresAt: number;
+}
+
+const DEFAULT_OWN_WRITE_WINDOW_MS = 300;
+
 export class StorageService {
     /** Hash used by the file watcher to distinguish the service's own write. */
     public _lastWrittenHash: string | undefined;
@@ -20,52 +30,95 @@ export class StorageService {
     // Wall-clock milliseconds; comments.json watchers should ignore writes until then.
     private suppressWatcherUntil = 0;
     private ignoreWatchDepth = 0;
+    private readonly ownWrites = new Map<string, OwnWriteRecord>();
+    private readonly reviewRevisions = new Map<string, number>();
 
-    constructor(private readonly localPrManager: LocalPrManager) {}
+    constructor(
+        private readonly localPrManager: LocalPrManager,
+        private readonly now: () => number = () => Date.now(),
+        private readonly ownWriteWindowMs: number = DEFAULT_OWN_WRITE_WINDOW_MS
+    ) {}
 
-    private markOwnWrite(serializedContent: string): void {
+    getReviewRevision(reviewId: string): number {
+        return this.reviewRevisions.get(reviewId) ?? 0;
+    }
+
+    /** Signal an external watcher event before any debounce or suppression delay. */
+    markExternalChange(reviewId: string): void {
+        if (this.localPrManager.getReviewById(reviewId)) {
+            this.markReviewChanged(reviewId);
+        }
+    }
+
+    private markReviewChanged(reviewId: string): void {
+        this.reviewRevisions.set(reviewId, this.getReviewRevision(reviewId) + 1);
+    }
+
+    private markOwnWrite(serializedContent: string, filePath: string): void {
         this._lastWrittenHash = crypto
             .createHash('sha1')
             .update(serializedContent)
             .digest('hex');
+        const deadline = this.now() + this.ownWriteWindowMs;
+        this.ownWrites.set(filePath, {
+            expectedHash: serializedContent === '' ? undefined : this._lastWrittenHash,
+            expiresAt: deadline,
+        });
 
-        // The short time window handles delete/create races. The content hash is
-        // the durable own-write check and avoids dropping unrelated later edits.
-        this.suppressWatcherUntil = Date.now() + 300;
+        // Multiple immediate watcher events can belong to one write, but exact
+        // byte/absence recognition is intentionally bounded by this deadline.
+        this.suppressWatcherUntil = Math.max(this.suppressWatcherUntil, deadline);
         this.ignoreWatchDepth++;
         setTimeout(() => {
             this.ignoreWatchDepth = Math.max(0, this.ignoreWatchDepth - 1);
         }, 0);
     }
 
-    shouldIgnoreWatch(fsPath?: string): boolean {
-        if (this.ignoreWatchDepth > 0) {
-            return true;
-        }
-
-        if (fsPath && this._lastWrittenHash && fs.existsSync(fsPath)) {
-            try {
-                const hash = crypto
-                    .createHash('sha1')
-                    .update(fs.readFileSync(fsPath))
-                    .digest('hex');
-                if (hash === this._lastWrittenHash) {
-                    return true;
+    classifyWatch(fsPath?: string): WatchEventClassification {
+        const now = this.now();
+        const ownWrite = fsPath ? this.ownWrites.get(fsPath) : undefined;
+        if (fsPath && ownWrite) {
+            if (now >= ownWrite.expiresAt) {
+                this.ownWrites.delete(fsPath);
+            } else {
+                try {
+                    if (ownWrite.expectedHash === undefined) {
+                        if (!fs.existsSync(fsPath)) {
+                            return 'exactOwnWrite';
+                        }
+                    } else if (fs.existsSync(fsPath)) {
+                        const actualHash = crypto
+                            .createHash('sha1')
+                            .update(fs.readFileSync(fsPath))
+                            .digest('hex');
+                        if (actualHash === ownWrite.expectedHash) {
+                            return 'exactOwnWrite';
+                        }
+                    }
+                } catch {
+                    // An unreadable or changing path is never an exact own write.
                 }
-            } catch {
-                // Fall through to the short suppression window.
             }
         }
+        if (this.ignoreWatchDepth > 0 || now < this.suppressWatcherUntil) {
+            return 'suppressed';
+        }
+        return 'external';
+    }
 
-        return Date.now() < this.suppressWatcherUntil;
+    shouldIgnoreWatch(fsPath?: string): boolean {
+        return this.classifyWatch(fsPath) !== 'external';
     }
 
     msUntilWatchAllowed(): number {
-        return Math.max(0, this.suppressWatcherUntil - Date.now());
+        return Math.max(0, this.suppressWatcherUntil - this.now());
     }
 
     async withWatchSuppressed<T>(fn: () => Promise<T> | T): Promise<T> {
-        this.suppressWatcherUntil = Date.now() + 5000;
+        this.suppressWatcherUntil = Math.max(
+            this.suppressWatcherUntil,
+            this.now() + 5000
+        );
         this.ignoreWatchDepth++;
         try {
             return await fn();
@@ -106,6 +159,29 @@ export class StorageService {
         return this.createCommentsShell(review);
     }
 
+    /** Mutations must never replace a present malformed or unsupported file. */
+    private loadCommentsForMutation(reviewId: string): CommentsFile {
+        const review = this.localPrManager.getReviewById(reviewId);
+        if (!review) {
+            throw new Error(`Offline Review ${reviewId} no longer exists`);
+        }
+        const filePath = this.localPrManager.getCommentsFilePath(review);
+        if (!fs.existsSync(filePath)) {
+            return this.createCommentsShell(review);
+        }
+        try {
+            const parsed: unknown = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+            if (isCurrentCommentsFile(parsed)) {
+                return parsed;
+            }
+        } catch {
+            // Report one stable refusal below without exposing parser details.
+        }
+        throw new Error(
+            'Review comments file is malformed or unsupported; refusing to overwrite it'
+        );
+    }
+
     /** Write one explicit UUID-owned bucket without consulting active review state. */
     saveCommentsForReview(reviewId: string, comments: CommentsFile): void {
         const review = this.localPrManager.getReviewById(reviewId);
@@ -117,7 +193,7 @@ export class StorageService {
 
         // Empty comments remove only this review's UUID-owned file/directory.
         if (comments.threads.length === 0) {
-            this.markOwnWrite('');
+            this.markOwnWrite('', filePath);
             if (fs.existsSync(filePath)) {
                 fs.unlinkSync(filePath);
                 const reviewDir = path.dirname(filePath);
@@ -125,14 +201,16 @@ export class StorageService {
                     fs.rmdirSync(reviewDir);
                 }
             }
+            this.markReviewChanged(reviewId);
             return;
         }
 
         const reviewDir = path.dirname(filePath);
         fs.mkdirSync(reviewDir, { recursive: true });
         const serialized = JSON.stringify(comments, null, 2);
-        this.markOwnWrite(serialized);
+        this.markOwnWrite(serialized, filePath);
         fs.writeFileSync(filePath, serialized, 'utf-8');
+        this.markReviewChanged(reviewId);
     }
 
     ensureCommentsFileForReview(reviewId: string): void {
@@ -148,7 +226,7 @@ export class StorageService {
 
         fs.mkdirSync(path.dirname(filePath), { recursive: true });
         const serialized = JSON.stringify(this.createCommentsShell(review), null, 2);
-        this.markOwnWrite(serialized);
+        this.markOwnWrite(serialized, filePath);
         fs.writeFileSync(filePath, serialized, 'utf-8');
     }
 
@@ -161,12 +239,13 @@ export class StorageService {
         if (!fs.existsSync(filePath)) {
             return false;
         }
-        this.markOwnWrite('');
+        this.markOwnWrite('', filePath);
         fs.unlinkSync(filePath);
         const reviewDir = path.dirname(filePath);
         if (fs.existsSync(reviewDir) && fs.readdirSync(reviewDir).length === 0) {
             fs.rmdirSync(reviewDir);
         }
+        this.markReviewChanged(reviewId);
         return true;
     }
 
@@ -189,17 +268,15 @@ export class StorageService {
         startLine: number,
         endLine: number,
         body: string,
-        author: string
+        author: string,
+        sourceAnchor?: string
     ): ReviewThread {
         const review = this.localPrManager.getReviewById(reviewId);
         if (!review) {
             throw new Error(`Offline Review ${reviewId} no longer exists`);
         }
         validateThreadTarget(review, target, filePath);
-        const comments = this.loadCommentsForReview(reviewId);
-        if (!comments) {
-            throw new Error(`Could not load Offline Review ${reviewId}`);
-        }
+        const comments = this.loadCommentsForMutation(reviewId);
 
         const thread: ReviewThread = {
             id: crypto.randomUUID(),
@@ -213,6 +290,7 @@ export class StorageService {
                 author,
                 timestamp: new Date().toISOString(),
             }],
+            ...(sourceAnchor === undefined ? {} : { sourceAnchor }),
             target,
         };
 
@@ -227,10 +305,10 @@ export class StorageService {
         body: string,
         author: string
     ): ReviewComment | undefined {
-        const comments = this.loadCommentsForReview(reviewId);
-        if (!comments || !this.localPrManager.getReviewById(reviewId)) {
+        if (!this.localPrManager.getReviewById(reviewId)) {
             return undefined;
         }
+        const comments = this.loadCommentsForMutation(reviewId);
 
         const thread = comments.threads.find(candidate => candidate.id === threadId);
         if (!thread) {
@@ -262,10 +340,10 @@ export class StorageService {
         threadId: string,
         state: ReviewThread['state']
     ): boolean {
-        const comments = this.loadCommentsForReview(reviewId);
-        if (!comments || !this.localPrManager.getReviewById(reviewId)) {
+        if (!this.localPrManager.getReviewById(reviewId)) {
             return false;
         }
+        const comments = this.loadCommentsForMutation(reviewId);
 
         const thread = comments.threads.find(candidate => candidate.id === threadId);
         if (!thread) {
@@ -277,7 +355,7 @@ export class StorageService {
     }
 
     deleteComment(reviewId: string, threadId: string, commentId: string): boolean {
-        const comments = this.loadCommentsForReview(reviewId);
+        const comments = this.loadCommentsForMutation(reviewId);
         if (!comments || !this.localPrManager.getReviewById(reviewId)) {
             return false;
         }
@@ -296,7 +374,7 @@ export class StorageService {
     }
 
     editComment(reviewId: string, threadId: string, commentId: string, newBody: string): boolean {
-        const comments = this.loadCommentsForReview(reviewId);
+        const comments = this.loadCommentsForMutation(reviewId);
         if (!comments || !this.localPrManager.getReviewById(reviewId)) {
             return false;
         }
@@ -387,6 +465,8 @@ function isCurrentCommentsFile(value: unknown): value is CommentsFile {
         && typeof thread.startLine === 'number'
         && typeof thread.endLine === 'number'
         && (thread.state === 'resolved' || thread.state === 'unresolved')
+        && (!Object.prototype.hasOwnProperty.call(thread, 'sourceAnchor')
+            || typeof thread.sourceAnchor === 'string')
         && Array.isArray(thread.comments)
         && thread.comments.every(comment => isRecord(comment)
             && typeof comment.id === 'string'

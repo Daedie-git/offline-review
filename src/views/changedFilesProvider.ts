@@ -3,13 +3,13 @@ import {
     CommitInfo,
     DiffPlan,
     FileChange,
-    isThreadCurrentForPlan,
     LocalPr,
     PreparedDiffState,
 } from '../types';
 import { FileDiffUris, GitService } from '../git/gitService';
 import { StorageService } from '../storage/storageService';
 import { LocalPrManager } from '../services/localPrManager';
+import { isEffectiveReviewProjection, ReviewAnchorResolver } from '../comments/reviewAnchorResolver';
 
 export type ChangedFileTreeItem = SectionItem | FolderItem | FileChangeItem | CommitItem | MessageItem;
 
@@ -28,8 +28,9 @@ export class ChangedFilesProvider implements vscode.TreeDataProvider<ChangedFile
 
     constructor(
         private readonly gitService: GitService,
-        private readonly storageService: StorageService,
-        private readonly localPrManager: LocalPrManager
+        _storageService: StorageService,
+        private readonly localPrManager: LocalPrManager,
+        private readonly anchorResolver?: ReviewAnchorResolver
     ) {
         this.reviewedFiles = new Set(localPrManager.getReviewedFiles());
     }
@@ -149,23 +150,16 @@ export class ChangedFilesProvider implements vscode.TreeDataProvider<ChangedFile
         if (!this.plan) {
             return counts;
         }
-        const comments = this.storageService.loadCommentsForReview(this.plan.reviewId);
-        if (!comments) {
+        const state = this.anchorResolver?.getAppliedState(this.plan);
+        if (!state) {
             return counts;
         }
-        const filesByPath = new Map(this.files.map(file => [file.filePath, file]));
-        for (const thread of comments.threads) {
-            const file = filesByPath.get(thread.filePath);
-            if (file && thread.state !== 'resolved'
-                && isThreadCurrentForPlan(
-                    thread,
-                    this.plan,
-                    file.filePath,
-                    file.status === 'deleted' ? 'original' : 'modified'
-                )) {
+        for (const projection of state.projections) {
+            const thread = projection.thread;
+            if (thread.state === 'unresolved' && isEffectiveReviewProjection(projection)) {
                 counts.set(
-                    file.filePath,
-                    (counts.get(file.filePath) ?? 0) + 1
+                    thread.filePath,
+                    (counts.get(thread.filePath) ?? 0) + 1
                 );
             }
         }

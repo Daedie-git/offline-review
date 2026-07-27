@@ -1,8 +1,8 @@
-import * as os from 'os';
 import * as vscode from 'vscode';
+import { AuthorIdentity } from '../authorIdentity';
 import { WorkspacePathResolver } from './pathResolver';
 import { WorkspaceCommentStorage } from './storage';
-import { WorkspaceComment, WorkspaceCommentThread } from './types';
+import { WorkspaceComment, WorkspaceCommentThread, WorkspaceThreadReport } from './types';
 
 interface ManagedThread extends vscode.CommentThread {
     __workspaceThreadId?: string;
@@ -20,18 +20,20 @@ interface CommentWithParent extends vscode.Comment {
 
 export class WorkspaceCommentController {
     private readonly controller: vscode.CommentController;
+    private readonly commentingRangeProvider: vscode.CommentingRangeProvider;
     private readonly threads = new Map<string, ManagedThread>();
     private readonly commentIdentities = new WeakMap<vscode.Comment, CommentIdentity>();
 
     constructor(
         private readonly storage: WorkspaceCommentStorage,
-        private readonly pathResolver: WorkspacePathResolver
+        private readonly pathResolver: WorkspacePathResolver,
+        private readonly authorIdentity: AuthorIdentity = new AuthorIdentity()
     ) {
         this.controller = vscode.comments.createCommentController(
             'localCodeComments',
             'Offline Review Code Comments'
         );
-        this.controller.commentingRangeProvider = {
+        this.commentingRangeProvider = {
             provideCommentingRanges: (document: vscode.TextDocument): vscode.Range[] => {
                 if (!this.pathResolver.resolveUri(document.uri)) {
                     return [];
@@ -45,17 +47,28 @@ export class WorkspaceCommentController {
                 )];
             },
         };
+        this.controller.commentingRangeProvider = this.commentingRangeProvider;
         this.controller.options = {
             prompt: 'Add workspace code comment',
             placeHolder: 'Comment on this workspace code',
         };
     }
 
+    /**
+     * Republishes the provider so hosts recompute commentable ranges for the
+     * current editor. Cursor can otherwise retain an empty range cache after
+     * activation or a same-version extension reload.
+     */
+    refreshCommentingRanges(): void {
+        this.controller.commentingRangeProvider = this.commentingRangeProvider;
+    }
+
     loadAllThreads(): void {
         const retained = new Set<string>();
         for (const saved of this.storage.getReports()) {
             const uri = this.pathResolver.uriForStoredPath(saved.filePath);
-            if (!uri || saved.rangeStatus === 'outOfRange') {
+            if (!uri
+                || (saved.anchorStatus !== 'current' && saved.anchorStatus !== 'reanchored')) {
                 continue;
             }
             retained.add(saved.id);
@@ -91,18 +104,27 @@ export class WorkspaceCommentController {
             endLine,
             sourceAnchor,
             body,
-            os.userInfo().username
+            this.authorIdentity.get()
         );
         if (existingThread) {
             this.populateThread(existingThread as ManagedThread, saved);
         } else {
-            this.createOrUpdateThread(resolved.uri, saved);
+            this.createOrUpdateThread(resolved.uri, {
+                ...saved,
+                pathStatus: 'current',
+                anchorStatus: 'current',
+                rangeStatus: 'current',
+                effectiveStartLine: startLine,
+                effectiveEndLine: endLine,
+                matches: [{ startLine, endLine }],
+                stale: false,
+            });
         }
     }
 
     addReply(thread: vscode.CommentThread, body: string): void {
         const threadId = this.requireThreadId(thread);
-        const comment = this.storage.addReply(threadId, body, os.userInfo().username);
+        const comment = this.storage.addReply(threadId, body, this.authorIdentity.get());
         thread.comments = [...thread.comments, this.toVscodeComment(threadId, comment)];
     }
 
@@ -151,7 +173,12 @@ export class WorkspaceCommentController {
         this.controller.dispose();
     }
 
-    private createOrUpdateThread(uri: vscode.Uri, saved: WorkspaceCommentThread): void {
+    private createOrUpdateThread(uri: vscode.Uri, saved: WorkspaceThreadReport): void {
+        const startLine = saved.effectiveStartLine;
+        const endLine = saved.effectiveEndLine;
+        if (startLine === undefined || endLine === undefined) {
+            return;
+        }
         let existing = this.threads.get(saved.id);
         if (existing && existing.uri.fsPath !== uri.fsPath) {
             existing.dispose();
@@ -160,13 +187,13 @@ export class WorkspaceCommentController {
         }
         if (existing) {
             existing.comments = this.toVscodeComments(saved);
-            existing.range = new vscode.Range(saved.startLine, 0, saved.endLine, 0);
+            existing.range = new vscode.Range(startLine, 0, endLine, 0);
             this.applyState(existing, saved);
             return;
         }
         const thread = this.controller.createCommentThread(
             uri,
-            new vscode.Range(saved.startLine, 0, saved.endLine, 0),
+            new vscode.Range(startLine, 0, endLine, 0),
             []
         ) as ManagedThread;
         this.populateThread(thread, saved);

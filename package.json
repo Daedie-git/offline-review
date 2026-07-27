@@ -323,7 +323,12 @@
         {
           "command": "localPrReview.refreshPrs",
           "when": "view == localPrReview.localPrs",
-          "group": "navigation"
+          "group": "navigation@1"
+        },
+        {
+          "command": "localPrReview.clearAllReviews",
+          "when": "view == localPrReview.localPrs",
+          "group": "navigation@2"
         },
         {
           "command": "localPrReview.refreshComments",

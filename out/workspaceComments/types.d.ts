@@ -20,9 +20,18 @@ export interface WorkspaceCommentsFile {
     threads: WorkspaceCommentThread[];
 }
 export type WorkspacePathStatus = 'current' | 'missing' | 'unsafe';
-export type WorkspaceRangeStatus = 'current' | 'stale' | 'outOfRange' | 'unavailable';
+export type WorkspaceAnchorStatus = 'current' | 'reanchored' | 'notFound' | 'ambiguous' | 'unavailable';
+export type WorkspaceRangeStatus = 'current' | 'reanchored' | 'stale' | 'ambiguous' | 'unavailable';
+export interface WorkspaceAnchorMatch {
+    readonly startLine: number;
+    readonly endLine: number;
+}
 export interface WorkspaceThreadReport extends WorkspaceCommentThread {
     pathStatus: WorkspacePathStatus;
+    anchorStatus: WorkspaceAnchorStatus;
     rangeStatus: WorkspaceRangeStatus;
+    effectiveStartLine?: number;
+    effectiveEndLine?: number;
+    matches: readonly WorkspaceAnchorMatch[];
     stale: boolean;
 }

@@ -3,11 +3,12 @@ import { CommitInfo, DiffPlan, FileChange, LocalPr, PreparedDiffState } from '..
 import { FileDiffUris, GitService } from '../git/gitService';
 import { StorageService } from '../storage/storageService';
 import { LocalPrManager } from '../services/localPrManager';
+import { ReviewAnchorResolver } from '../comments/reviewAnchorResolver';
 export type ChangedFileTreeItem = SectionItem | FolderItem | FileChangeItem | CommitItem | MessageItem;
 export declare class ChangedFilesProvider implements vscode.TreeDataProvider<ChangedFileTreeItem> {
     private readonly gitService;
-    private readonly storageService;
     private readonly localPrManager;
+    private readonly anchorResolver?;
     private readonly _onDidChangeTreeData;
     readonly onDidChangeTreeData: vscode.Event<ChangedFileTreeItem | undefined>;
     private files;
@@ -18,7 +19,7 @@ export declare class ChangedFilesProvider implements vscode.TreeDataProvider<Cha
     private filesSection;
     private commitsSection;
     private requestGeneration;
-    constructor(gitService: GitService, storageService: StorageService, localPrManager: LocalPrManager);
+    constructor(gitService: GitService, _storageService: StorageService, localPrManager: LocalPrManager, anchorResolver?: ReviewAnchorResolver | undefined);
     getTreeItem(element: ChangedFileTreeItem): vscode.TreeItem;
     getChildren(element?: ChangedFileTreeItem): ChangedFileTreeItem[];
     getParent(element: ChangedFileTreeItem): ChangedFileTreeItem | undefined;

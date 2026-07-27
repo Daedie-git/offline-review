@@ -36,11 +36,13 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.LocalReviewTool = void 0;
 const vscode = __importStar(require("vscode"));
 const types_1 = require("../types");
+const reviewAnchorResolver_1 = require("../comments/reviewAnchorResolver");
 class LocalReviewTool {
-    constructor(gitService, localPrManager, storageService) {
+    constructor(gitService, localPrManager, storageService, anchorResolver) {
         this.gitService = gitService;
         this.localPrManager = localPrManager;
         this.storageService = storageService;
+        this.anchorResolver = anchorResolver;
     }
     async prepareInvocation(options, _token) {
         const confirmationMessages = {
@@ -65,14 +67,23 @@ class LocalReviewTool {
             return textResult(`Review found: ${label}. However, there are no comments yet. `
                 + 'Tell the user to open a file from Changed Files and use the diff gutter to add a comment.');
         }
+        if (filePath && (0, reviewAnchorResolver_1.normalizeReviewFilePath)(filePath) !== filePath) {
+            return textResult(JSON.stringify({
+                error: 'filePath must be an exact normalized repository-relative path',
+            }, null, 2));
+        }
         let threads = comments.threads;
         if (filePath) {
-            threads = threads.filter(thread => thread.filePath.includes(filePath));
+            threads = threads.filter(thread => thread.filePath === filePath);
         }
         if (state) {
             threads = threads.filter(thread => thread.state === state);
         }
         const comparison = (0, types_1.getReviewSourceTarget)(review);
+        const applied = this.anchorResolver?.getAppliedState();
+        const projectionById = new Map(applied?.plan.reviewId === review.id
+            ? applied.projections.map(projection => [projection.thread.id, projection])
+            : []);
         const result = {
             review: {
                 id: review.id,
@@ -84,18 +95,44 @@ class LocalReviewTool {
             totalThreads: comments.threads.length,
             unresolvedCount: comments.threads.filter(thread => thread.state === 'unresolved').length,
             resolvedCount: comments.threads.filter(thread => thread.state === 'resolved').length,
-            threads: threads.map(thread => ({
-                id: thread.id,
-                filePath: thread.filePath,
-                startLine: thread.startLine,
-                endLine: thread.endLine,
-                state: thread.state,
-                comments: thread.comments.map(comment => ({
-                    author: comment.author,
-                    body: comment.body,
-                    timestamp: comment.timestamp,
-                })),
-            })),
+            threads: threads.map(thread => {
+                const projection = projectionById.get(thread.id);
+                const effective = projection && (0, reviewAnchorResolver_1.isEffectiveReviewProjection)(projection);
+                const side = projection?.side
+                    ?? (thread.target.kind === 'git' ? thread.target.side ?? 'modified' : 'modified');
+                return {
+                    id: thread.id,
+                    filePath: thread.filePath,
+                    authoredStartLine: thread.startLine,
+                    authoredEndLine: thread.endLine,
+                    effectiveStartLine: effective ? projection.effectiveStartLine : undefined,
+                    effectiveEndLine: effective ? projection.effectiveEndLine : undefined,
+                    side,
+                    sourceAnchor: thread.sourceAnchor,
+                    anchorStatus: projection?.anchorStatus ?? 'unavailable',
+                    matches: projection?.matches ?? [],
+                    currentPlanPlacement: effective ? {
+                        status: 'effective',
+                        uri: projection.currentPlanUri,
+                        startLine: projection.effectiveStartLine,
+                        endLine: projection.effectiveEndLine,
+                    } : {
+                        status: projection?.anchorStatus ?? 'unavailable',
+                        uri: projection?.currentPlanUri,
+                    },
+                    historicalGitPlacement: !effective && projection?.historicalGitUri ? {
+                        uri: projection.historicalGitUri,
+                        startLine: thread.startLine,
+                        endLine: thread.endLine,
+                    } : undefined,
+                    state: thread.state,
+                    comments: thread.comments.map(comment => ({
+                        author: comment.author,
+                        body: comment.body,
+                        timestamp: comment.timestamp,
+                    })),
+                };
+            }),
         };
         return textResult(JSON.stringify(result, null, 2));
     }

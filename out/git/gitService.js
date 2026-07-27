@@ -593,22 +593,28 @@ class GitService {
         return getFileDiffUris(plan, change);
     }
     async getFileContent(document, filePath) {
+        const result = await this.getFileContentResult(document, filePath);
+        return result.status === 'available' ? result.content : '';
+    }
+    /** Read content while preserving the distinction between an empty blob and failure. */
+    async getFileContentResult(document, filePath) {
         if (!isSafeRelativeGitPath(filePath)) {
-            return '';
+            return { status: 'unavailable' };
         }
         if (document.kind === 'worktree') {
-            return this.getWorkingTreeFileContent(document.worktreeRoot, filePath);
+            return this.getWorkingTreeFileContentResult(document.worktreeRoot, filePath);
         }
         if (!isFullObjectId(document.ref)) {
-            return '';
+            return { status: 'unavailable' };
         }
         try {
             // Linked worktrees share object storage. Reading immutable objects
             // from Local avoids trusting a root supplied by a virtual URI.
-            return await this.execGit(['cat-file', 'blob', `${document.ref}:${filePath}`], DEFAULT_GIT_TIMEOUT, this.localWorkspaceRoot);
+            const content = await this.execGit(['cat-file', 'blob', `${document.ref}:${filePath}`], DEFAULT_GIT_TIMEOUT, this.localWorkspaceRoot);
+            return { status: 'available', content };
         }
         catch {
-            return '';
+            return { status: 'unavailable' };
         }
     }
     async getCommitsForDiff(plan) {
@@ -678,15 +684,15 @@ class GitService {
         }
         return resolved;
     }
-    async getWorkingTreeFileContent(worktreeRoot, filePath) {
+    async getWorkingTreeFileContentResult(worktreeRoot, filePath) {
         try {
             if (!await this.isLinkedWorktreeRoot(worktreeRoot)) {
-                return '';
+                return { status: 'unavailable' };
             }
             const root = normalizeRoot(worktreeRoot);
             const absolutePath = path.resolve(root, filePath);
             if (!isPathInside(root, absolutePath)) {
-                return '';
+                return { status: 'unavailable' };
             }
             // Resolve the parent to prevent an untracked symlinked directory
             // from turning a forged virtual URI into an arbitrary file read.
@@ -695,23 +701,29 @@ class GitService {
                 fs.promises.realpath(path.dirname(absolutePath)),
             ]);
             if (!isPathInside(realRoot, realParent, true)) {
-                return '';
+                return { status: 'unavailable' };
             }
             const stat = await fs.promises.lstat(absolutePath);
             if (stat.isSymbolicLink()) {
-                return await fs.promises.readlink(absolutePath, 'utf8');
+                return {
+                    status: 'available',
+                    content: await fs.promises.readlink(absolutePath, 'utf8'),
+                };
             }
             if (!stat.isFile()) {
-                return '';
+                return { status: 'unavailable' };
             }
             const realFile = await fs.promises.realpath(absolutePath);
             if (!isPathInside(realRoot, realFile)) {
-                return '';
+                return { status: 'unavailable' };
             }
-            return await fs.promises.readFile(realFile, 'utf8');
+            return {
+                status: 'available',
+                content: await fs.promises.readFile(realFile, 'utf8'),
+            };
         }
         catch {
-            return '';
+            return { status: 'unavailable' };
         }
     }
     assertValidPlan(plan) {

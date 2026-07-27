@@ -3,6 +3,11 @@ import { GitService } from '../git/gitService';
 import { LocalPrManager } from '../services/localPrManager';
 import { StorageService } from '../storage/storageService';
 import { formatReviewLabel, getReviewSourceTarget, LocalPr } from '../types';
+import {
+    isEffectiveReviewProjection,
+    normalizeReviewFilePath,
+    ReviewAnchorResolver,
+} from '../comments/reviewAnchorResolver';
 
 interface ToolInput {
     filePath?: string;
@@ -13,7 +18,8 @@ export class LocalReviewTool implements vscode.LanguageModelTool<ToolInput> {
     constructor(
         private readonly gitService: GitService,
         private readonly localPrManager: LocalPrManager,
-        private readonly storageService: StorageService
+        private readonly storageService: StorageService,
+        private readonly anchorResolver?: ReviewAnchorResolver
     ) {}
 
     async prepareInvocation(
@@ -56,15 +62,26 @@ export class LocalReviewTool implements vscode.LanguageModelTool<ToolInput> {
             );
         }
 
+        if (filePath && normalizeReviewFilePath(filePath) !== filePath) {
+            return textResult(JSON.stringify({
+                error: 'filePath must be an exact normalized repository-relative path',
+            }, null, 2));
+        }
         let threads = comments.threads;
         if (filePath) {
-            threads = threads.filter(thread => thread.filePath.includes(filePath));
+            threads = threads.filter(thread => thread.filePath === filePath);
         }
         if (state) {
             threads = threads.filter(thread => thread.state === state);
         }
 
         const comparison = getReviewSourceTarget(review);
+        const applied = this.anchorResolver?.getAppliedState();
+        const projectionById = new Map(
+            applied?.plan.reviewId === review.id
+                ? applied.projections.map(projection => [projection.thread.id, projection])
+                : []
+        );
         const result = {
             review: {
                 id: review.id,
@@ -76,18 +93,44 @@ export class LocalReviewTool implements vscode.LanguageModelTool<ToolInput> {
             totalThreads: comments.threads.length,
             unresolvedCount: comments.threads.filter(thread => thread.state === 'unresolved').length,
             resolvedCount: comments.threads.filter(thread => thread.state === 'resolved').length,
-            threads: threads.map(thread => ({
-                id: thread.id,
-                filePath: thread.filePath,
-                startLine: thread.startLine,
-                endLine: thread.endLine,
-                state: thread.state,
-                comments: thread.comments.map(comment => ({
-                    author: comment.author,
-                    body: comment.body,
-                    timestamp: comment.timestamp,
-                })),
-            })),
+            threads: threads.map(thread => {
+                const projection = projectionById.get(thread.id);
+                const effective = projection && isEffectiveReviewProjection(projection);
+                const side = projection?.side
+                    ?? (thread.target.kind === 'git' ? thread.target.side ?? 'modified' : 'modified');
+                return {
+                    id: thread.id,
+                    filePath: thread.filePath,
+                    authoredStartLine: thread.startLine,
+                    authoredEndLine: thread.endLine,
+                    effectiveStartLine: effective ? projection.effectiveStartLine : undefined,
+                    effectiveEndLine: effective ? projection.effectiveEndLine : undefined,
+                    side,
+                    sourceAnchor: thread.sourceAnchor,
+                    anchorStatus: projection?.anchorStatus ?? 'unavailable',
+                    matches: projection?.matches ?? [],
+                    currentPlanPlacement: effective ? {
+                        status: 'effective',
+                        uri: projection.currentPlanUri,
+                        startLine: projection.effectiveStartLine,
+                        endLine: projection.effectiveEndLine,
+                    } : {
+                        status: projection?.anchorStatus ?? 'unavailable',
+                        uri: projection?.currentPlanUri,
+                    },
+                    historicalGitPlacement: !effective && projection?.historicalGitUri ? {
+                        uri: projection.historicalGitUri,
+                        startLine: thread.startLine,
+                        endLine: thread.endLine,
+                    } : undefined,
+                    state: thread.state,
+                    comments: thread.comments.map(comment => ({
+                        author: comment.author,
+                        body: comment.body,
+                        timestamp: comment.timestamp,
+                    })),
+                };
+            }),
         };
         return textResult(JSON.stringify(result, null, 2));
     }

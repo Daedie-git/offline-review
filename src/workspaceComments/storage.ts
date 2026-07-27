@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { TextDecoder } from 'util';
+import { resolveExactLineSequence } from '../lineSequenceResolver';
 import { withFileLock } from './fileLock';
 import { WorkspacePathResolver } from './pathResolver';
 import { assertOrdinaryPath, canonicalPath, sameCanonicalPath } from './safeFilesystem';
@@ -34,6 +35,18 @@ interface StorageDirectory {
 }
 
 const ABSENT_FINGERPRINT = 'absent';
+const DEFAULT_OWN_WRITE_WINDOW_MS = 300;
+
+export type WorkspaceWatchEventClassification =
+    | 'exactOwnWrite'
+    | 'suppressed'
+    | 'external';
+
+interface OwnWriteRecord {
+    /** Undefined means this write intentionally removed the canonical file. */
+    readonly expectedHash: string | undefined;
+    readonly expiresAt: number;
+}
 
 export class WorkspaceCommentStorage {
     readonly filePath: string;
@@ -41,10 +54,15 @@ export class WorkspaceCommentStorage {
     public _lastWrittenHash: string | undefined;
     private suppressWatcherUntil = 0;
     private ignoreWatchDepth = 0;
+    private readonly ownWrites = new Map<string, OwnWriteRecord>();
+    private readonly directorySyncCapabilities = new Set<string>();
+    private readonly hardLinkCapabilities = new Set<string>();
 
     constructor(
         _workspaceRoot: string,
-        private readonly pathResolver: WorkspacePathResolver
+        private readonly pathResolver: WorkspacePathResolver,
+        private readonly now: () => number = () => Date.now(),
+        private readonly ownWriteWindowMs: number = DEFAULT_OWN_WRITE_WINDOW_MS
     ) {
         const directory = path.join(pathResolver.canonicalRoot, '.vscode', 'local-reviews');
         this.filePath = path.join(directory, 'workspace-comments.json');
@@ -56,17 +74,58 @@ export class WorkspaceCommentStorage {
     }
 
     getReports(): WorkspaceThreadReport[] {
+        const contentByPath = new Map<string, string | undefined>();
         return this.load().threads.map(thread => {
             const pathStatus = this.pathResolver.inspectStoredPath(thread.filePath);
-            const anchor = pathStatus === 'current' ? this.readAnchor(thread) : undefined;
-            const rangeStatus = pathStatus !== 'current'
-                ? 'unavailable'
-                : anchor === undefined ? 'outOfRange'
-                    : anchor === thread.sourceAnchor ? 'current' : 'stale';
+            if (pathStatus !== 'current') {
+                return {
+                    ...thread,
+                    pathStatus,
+                    anchorStatus: 'unavailable' as const,
+                    rangeStatus: 'unavailable' as const,
+                    matches: [],
+                    stale: false,
+                };
+            }
+
+            let content = contentByPath.get(thread.filePath);
+            if (!contentByPath.has(thread.filePath)) {
+                const uri = this.pathResolver.uriForStoredPath(thread.filePath);
+                try {
+                    content = uri ? fs.readFileSync(uri.fsPath, 'utf8') : undefined;
+                } catch {
+                    content = undefined;
+                }
+                contentByPath.set(thread.filePath, content);
+            }
+            if (content === undefined) {
+                return {
+                    ...thread,
+                    pathStatus,
+                    anchorStatus: 'unavailable' as const,
+                    rangeStatus: 'unavailable' as const,
+                    matches: [],
+                    stale: false,
+                };
+            }
+
+            const resolution = resolveExactLineSequence(
+                content,
+                thread.sourceAnchor,
+                thread.startLine,
+                thread.endLine
+            );
+            const rangeStatus = resolution.status === 'notFound'
+                ? 'stale' as const
+                : resolution.status;
             return {
                 ...thread,
                 pathStatus,
+                anchorStatus: resolution.status,
                 rangeStatus,
+                effectiveStartLine: resolution.effectiveStartLine,
+                effectiveEndLine: resolution.effectiveEndLine,
+                matches: resolution.matches,
                 stale: rangeStatus === 'stale',
             };
         });
@@ -162,24 +221,39 @@ export class WorkspaceCommentStorage {
         });
     }
 
-    shouldIgnoreWatch(fsPath?: string): boolean {
-        if (this.ignoreWatchDepth > 0) {
-            return true;
-        }
-        if (fsPath && this._lastWrittenHash && fs.existsSync(fsPath)) {
-            try {
-                if (hash(fs.readFileSync(fsPath)) === this._lastWrittenHash) {
-                    return true;
+    classifyWatch(fsPath?: string): WorkspaceWatchEventClassification {
+        const now = this.now();
+        const ownWrite = fsPath ? this.ownWrites.get(fsPath) : undefined;
+        if (fsPath && ownWrite) {
+            if (now >= ownWrite.expiresAt) {
+                this.ownWrites.delete(fsPath);
+            } else {
+                try {
+                    if (ownWrite.expectedHash === undefined) {
+                        if (!fs.existsSync(fsPath)) {
+                            return 'exactOwnWrite';
+                        }
+                    } else if (fs.existsSync(fsPath)
+                        && hash(fs.readFileSync(fsPath)) === ownWrite.expectedHash) {
+                        return 'exactOwnWrite';
+                    }
+                } catch {
+                    // An unreadable or changing path is never an exact own write.
                 }
-            } catch {
-                // Fall through to the short suppression window.
             }
         }
-        return Date.now() < this.suppressWatcherUntil;
+        if (this.ignoreWatchDepth > 0 || now < this.suppressWatcherUntil) {
+            return 'suppressed';
+        }
+        return 'external';
+    }
+
+    shouldIgnoreWatch(fsPath?: string): boolean {
+        return this.classifyWatch(fsPath) !== 'external';
     }
 
     msUntilWatchAllowed(): number {
-        return Math.max(0, this.suppressWatcherUntil - Date.now());
+        return Math.max(0, this.suppressWatcherUntil - this.now());
     }
 
     private setThreadState(threadId: string, state: WorkspaceCommentState): void {
@@ -191,7 +265,7 @@ export class WorkspaceCommentStorage {
     private mutate<T>(mutation: (comments: WorkspaceCommentsFile) => T): T {
         const directory = this.ensureSafeStorageDirectory();
         try {
-            syncDirectoryStrict(directory);
+            this.preflightDirectorySync(directory);
             return withFileLock(this.entryPath(directory, path.basename(this.lockPath)), () => {
                 this.verifyStorageDirectory(directory);
                 const snapshot = this.loadSnapshot(true, directory);
@@ -205,6 +279,12 @@ export class WorkspaceCommentStorage {
     }
 
     private loadSnapshot(lockHeld: boolean, heldDirectory?: StorageDirectory): LoadedSnapshot {
+        if (!heldDirectory && this.hasSafelyAbsentStorageDirectory()) {
+            return {
+                comments: { version: 1, threads: [] },
+                fingerprint: ABSENT_FINGERPRINT,
+            };
+        }
         const directory = heldDirectory ?? this.ensureSafeStorageDirectory();
         try {
             this.revalidateStorage(directory);
@@ -371,7 +451,7 @@ export class WorkspaceCommentStorage {
         let temporaryCreated = false;
         let temporaryDurable = false;
         let recoveryEntriesRetired = false;
-        preflightHardLinks(directory, () => this.verifyStorageDirectory(directory));
+        this.preflightHardLinks(directory);
         try {
             descriptor = this.guardedOperation(directory,
                 () => fs.openSync(temporaryPath, 'wx', 0o600));
@@ -432,7 +512,7 @@ export class WorkspaceCommentStorage {
             this.assertExpectedFingerprint(expectedFingerprint, directory);
             return;
         }
-        preflightHardLinks(directory, () => this.verifyStorageDirectory(directory));
+        this.preflightHardLinks(directory);
         const backupPath = this.displaceAndVerify(expectedFingerprint, directory);
         syncDirectoryStrict(directory);
         this.guardedUnlink(backupPath, directory);
@@ -477,6 +557,25 @@ export class WorkspaceCommentStorage {
         if (actual !== expected) {
             throw changedOutsideLockError();
         }
+    }
+
+    private hasSafelyAbsentStorageDirectory(): boolean {
+        let current = this.pathResolver.canonicalRoot;
+        for (const component of ['.vscode', 'local-reviews']) {
+            const next = path.join(current, component);
+            if (!pathEntryExists(next)) {
+                return true;
+            }
+            const entry = fs.lstatSync(next);
+            if (entry.isSymbolicLink() || !entry.isDirectory()) {
+                throw new Error(`Unsafe workspace comments directory: ${next}`);
+            }
+            if (!sameCanonicalPath(canonicalPath(next), next)) {
+                throw new Error(`Unsafe workspace comments directory alias: ${next}`);
+            }
+            current = next;
+        }
+        return false;
     }
 
     private ensureSafeStorageDirectory(): StorageDirectory {
@@ -608,30 +707,38 @@ export class WorkspaceCommentStorage {
         this.guardedOperation(directory, () => fs.unlinkSync(filePath));
     }
 
+    private preflightDirectorySync(directory: StorageDirectory): void {
+        const identity = directoryIdentity(directory);
+        if (this.directorySyncCapabilities.has(identity)) {
+            return;
+        }
+        syncDirectoryStrict(directory);
+        this.directorySyncCapabilities.add(identity);
+    }
+
+    private preflightHardLinks(directory: StorageDirectory): void {
+        const identity = directoryIdentity(directory);
+        if (this.hardLinkCapabilities.has(identity)) {
+            return;
+        }
+        preflightHardLinks(directory, () => this.verifyStorageDirectory(directory));
+        this.hardLinkCapabilities.add(identity);
+    }
+
     private markOwnWrite(serialized: string): void {
         this._lastWrittenHash = hash(Buffer.from(serialized));
-        this.suppressWatcherUntil = Date.now() + 300;
+        const deadline = this.now() + this.ownWriteWindowMs;
+        this.ownWrites.set(this.filePath, {
+            expectedHash: serialized === '' ? undefined : this._lastWrittenHash,
+            expiresAt: deadline,
+        });
+        this.suppressWatcherUntil = Math.max(this.suppressWatcherUntil, deadline);
         this.ignoreWatchDepth++;
         setTimeout(() => {
             this.ignoreWatchDepth = Math.max(0, this.ignoreWatchDepth - 1);
         }, 0);
     }
 
-    private readAnchor(thread: WorkspaceCommentThread): string | undefined {
-        const uri = this.pathResolver.uriForStoredPath(thread.filePath);
-        if (!uri) {
-            return undefined;
-        }
-        try {
-            const lines = fs.readFileSync(uri.fsPath, 'utf8').split(/\r?\n/);
-            if (thread.startLine >= lines.length || thread.endLine >= lines.length) {
-                return undefined;
-            }
-            return lines.slice(thread.startLine, thread.endLine + 1).join('\n');
-        } catch {
-            return undefined;
-        }
-    }
 }
 
 export function isWorkspaceCommentsFile(
@@ -737,6 +844,12 @@ function matchesCapturedDirectory(stat: fs.Stats, directory: StorageDirectory): 
         return stat.dev === directory.dev && stat.ino === directory.ino;
     }
     return stat.ctimeMs === directory.ctimeMs && stat.birthtimeMs === directory.birthtimeMs;
+}
+
+function directoryIdentity(directory: StorageDirectory): string {
+    return directory.dev !== 0 && directory.ino !== 0
+        ? `${directory.dev}:${directory.ino}`
+        : `${directory.ctimeMs}:${directory.birthtimeMs}`;
 }
 
 function directoryPathHasIdentity(directoryPath: string, expected: fs.Stats): boolean {

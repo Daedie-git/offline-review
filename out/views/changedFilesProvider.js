@@ -35,12 +35,12 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.MessageItem = exports.CommitItem = exports.FileChangeItem = exports.FolderItem = exports.SectionItem = exports.ChangedFilesProvider = void 0;
 const vscode = __importStar(require("vscode"));
-const types_1 = require("../types");
+const reviewAnchorResolver_1 = require("../comments/reviewAnchorResolver");
 class ChangedFilesProvider {
-    constructor(gitService, storageService, localPrManager) {
+    constructor(gitService, _storageService, localPrManager, anchorResolver) {
         this.gitService = gitService;
-        this.storageService = storageService;
         this.localPrManager = localPrManager;
+        this.anchorResolver = anchorResolver;
         this._onDidChangeTreeData = new vscode.EventEmitter();
         this.onDidChangeTreeData = this._onDidChangeTreeData.event;
         this.files = [];
@@ -134,16 +134,14 @@ class ChangedFilesProvider {
         if (!this.plan) {
             return counts;
         }
-        const comments = this.storageService.loadCommentsForReview(this.plan.reviewId);
-        if (!comments) {
+        const state = this.anchorResolver?.getAppliedState(this.plan);
+        if (!state) {
             return counts;
         }
-        const filesByPath = new Map(this.files.map(file => [file.filePath, file]));
-        for (const thread of comments.threads) {
-            const file = filesByPath.get(thread.filePath);
-            if (file && thread.state !== 'resolved'
-                && (0, types_1.isThreadCurrentForPlan)(thread, this.plan, file.filePath, file.status === 'deleted' ? 'original' : 'modified')) {
-                counts.set(file.filePath, (counts.get(file.filePath) ?? 0) + 1);
+        for (const projection of state.projections) {
+            const thread = projection.thread;
+            if (thread.state === 'unresolved' && (0, reviewAnchorResolver_1.isEffectiveReviewProjection)(projection)) {
+                counts.set(thread.filePath, (counts.get(thread.filePath) ?? 0) + 1);
             }
         }
         return counts;

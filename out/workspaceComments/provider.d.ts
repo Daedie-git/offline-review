@@ -8,6 +8,7 @@ export declare class WorkspaceCommentsProvider implements vscode.TreeDataProvide
     private readonly pathResolver;
     private readonly _onDidChangeTreeData;
     readonly onDidChangeTreeData: vscode.Event<CodeCommentTreeItem | undefined>;
+    private reports;
     constructor(storage: WorkspaceCommentStorage, pathResolver: WorkspacePathResolver);
     getTreeItem(element: CodeCommentTreeItem): vscode.TreeItem;
     getChildren(element?: CodeCommentTreeItem): CodeCommentTreeItem[];

@@ -720,6 +720,7 @@ test('same-HEAD worktree comments remain attached after a document-cache refresh
     const { LocalPrManager } = built('services/localPrManager');
     const { StorageService } = built('storage/storageService');
     const { ReviewCommentController } = built('comments/commentController');
+    const { ReviewAnchorResolver } = built('comments/reviewAnchorResolver');
     const { getDiffDocumentUri, getFileDiffUris } = built('git/gitService');
     const { ChangedFilesProvider } = built('views/changedFilesProvider');
     const manager = new LocalPrManager({
@@ -728,7 +729,12 @@ test('same-HEAD worktree comments remain attached after a document-cache refresh
     const review = await manager.createUncommittedReview('feature', false);
     manager.setActiveReview(review.id);
     const storage = new StorageService(manager);
-    const controller = new ReviewCommentController(storage);
+    const anchorResolver = new ReviewAnchorResolver({
+        async getFileContentResult() {
+            return { status: 'available', content: 'dirty line\n' };
+        },
+    }, storage);
+    const controller = new ReviewCommentController(storage, anchorResolver);
     const plan = planId => ({
         kind: 'worktree',
         reviewId: review.id,
@@ -746,8 +752,16 @@ test('same-HEAD worktree comments remain attached after a document-cache refresh
         },
     });
     const firstPlan = plan(firstPlanId);
+    anchorResolver.applyPreparedState(await anchorResolver.prepare(firstPlan, [{
+        status: 'modified', filePath: 'dirty.txt',
+    }]));
     controller.setReviewableFiles(['dirty.txt']);
     controller.loadAllThreads(firstPlan);
+    vscode.workspace.openTextDocument = async uri => ({
+        uri,
+        lineCount: 1,
+        lineAt() { return { text: 'dirty line', range: { end: { character: 10 } } }; },
+    });
     const firstUri = getDiffDocumentUri(
         firstPlan.right,
         'dirty.txt',
@@ -755,14 +769,21 @@ test('same-HEAD worktree comments remain attached after a document-cache refresh
         review.id,
         workspace
     );
-    controller.createThread(
+    await controller.createThread(
         firstUri,
         new vscode.Range(0, 0, 0, 0),
         'survives refresh',
         'dirty.txt'
     );
+    assert.equal(
+        storage.loadCommentsForReview(review.id).threads[0].sourceAnchor,
+        'dirty line'
+    );
 
     const secondPlan = plan(secondPlanId);
+    anchorResolver.applyPreparedState(await anchorResolver.prepare(secondPlan, [{
+        status: 'modified', filePath: 'dirty.txt',
+    }]));
     const threadCountBefore = vscode.__createdCommentThreads.length;
     controller.loadAllThreads(secondPlan);
     const refreshedThread = vscode.__createdCommentThreads.at(-1);
@@ -775,7 +796,7 @@ test('same-HEAD worktree comments remain attached after a document-cache refresh
         },
         async getCommitsForDiff() { return []; },
         getFileDiffUris,
-    }, storage, manager);
+    }, storage, manager, anchorResolver);
     assert.equal(await provider.refresh(secondPlan), true);
     provider.getChildren();
     assert.equal(provider.getAllFileItems()[0].commentCount, 1);
@@ -793,6 +814,7 @@ test('deleted files accept comments on the immutable original side', async () =>
     const { LocalPrManager } = built('services/localPrManager');
     const { StorageService } = built('storage/storageService');
     const { ReviewCommentController } = built('comments/commentController');
+    const { ReviewAnchorResolver } = built('comments/reviewAnchorResolver');
     const { getDiffDocumentUri, getFileDiffUris } = built('git/gitService');
     const { ChangedFilesProvider } = built('views/changedFilesProvider');
     const manager = new LocalPrManager({
@@ -803,7 +825,12 @@ test('deleted files accept comments on the immutable original side', async () =>
     const review = await manager.createBranchReview('main', 'feature', false);
     manager.setActiveReview(review.id);
     const storage = new StorageService(manager);
-    const controller = new ReviewCommentController(storage);
+    const anchorResolver = new ReviewAnchorResolver({
+        async getFileContentResult() {
+            return { status: 'available', content: 'first\ndeleted line\n' };
+        },
+    }, storage);
+    const controller = new ReviewCommentController(storage, anchorResolver);
     const plan = {
         kind: 'branch',
         reviewId: review.id,
@@ -816,6 +843,9 @@ test('deleted files accept comments on the immutable original side', async () =>
         left: { kind: 'git', ref: baseCommit },
         right: { kind: 'git', ref: targetCommit },
     };
+    anchorResolver.applyPreparedState(await anchorResolver.prepare(plan, [{
+        status: 'deleted', filePath: 'deleted.txt',
+    }]));
     controller.setReviewableFiles(['deleted.txt'], ['deleted.txt']);
     controller.loadAllThreads(plan);
     const leftUri = getDiffDocumentUri(
@@ -835,8 +865,12 @@ test('deleted files accept comments on the immutable original side', async () =>
     const documentFor = uri => ({
         uri,
         lineCount: 2,
-        lineAt() { return { range: { end: { character: 4 } } }; },
+        lineAt(line) {
+            const text = line === 0 ? 'first' : 'deleted line';
+            return { text, range: { end: { character: text.length } } };
+        },
     });
+    vscode.workspace.openTextDocument = async uri => documentFor(uri);
     assert.equal(
         controller.controller.commentingRangeProvider
             .provideCommentingRanges(documentFor(leftUri)).length,
@@ -852,7 +886,7 @@ test('deleted files accept comments on the immutable original side', async () =>
         () => controller.captureNewThreadReviewId(rightUri, 'deleted.txt'),
         /prepared diff target/
     );
-    controller.createThread(
+    await controller.createThread(
         leftUri,
         new vscode.Range(1, 0, 1, 0),
         'comment on deleted line',
@@ -881,7 +915,7 @@ test('deleted files accept comments on the immutable original side', async () =>
         },
         async getCommitsForDiff() { return []; },
         getFileDiffUris,
-    }, storage, manager);
+    }, storage, manager, anchorResolver);
     assert.equal(await provider.refresh(plan), true);
     provider.getChildren();
     const deletedItem = provider.getAllFileItems()[0];
@@ -911,6 +945,9 @@ test('deleted files accept comments on the immutable original side', async () =>
             worktreeRoot: workspace,
         },
     };
+    anchorResolver.applyPreparedState(await anchorResolver.prepare(worktreePlan, [{
+        status: 'deleted', filePath: 'removed-worktree.txt',
+    }]));
     controller.setReviewableFiles(['removed-worktree.txt'], ['removed-worktree.txt']);
     controller.loadAllThreads(worktreePlan);
     const worktreeLeftUri = getDiffDocumentUri(
@@ -920,7 +957,7 @@ test('deleted files accept comments on the immutable original side', async () =>
         worktreeReview.id,
         workspace
     );
-    controller.createThread(
+    await controller.createThread(
         worktreeLeftUri,
         new vscode.Range(0, 0, 0, 0),
         'deleted before commit',
@@ -941,7 +978,7 @@ test('deleted files accept comments on the immutable original side', async () =>
     manager.dispose();
 });
 
-test('comment mutations stay in their owning UUID bucket and branch threads remain pinned', async () => {
+test('comment mutations stay UUID-owned while historical placement stays diagnostic', async () => {
     const workspace = temporaryDirectory('offline-review-comments-');
     installVscodeMock(workspace);
     const oldTarget = 'b'.repeat(40);
@@ -950,6 +987,7 @@ test('comment mutations stay in their owning UUID bucket and branch threads rema
     const { LocalPrManager } = built('services/localPrManager');
     const { StorageService } = built('storage/storageService');
     const { ReviewCommentController } = built('comments/commentController');
+    const { ReviewAnchorResolver } = built('comments/reviewAnchorResolver');
     const {
         getDiffDocumentUri,
         getFileDiffUris,
@@ -983,7 +1021,18 @@ test('comment mutations stay in their owning UUID bucket and branch threads rema
     });
     const planA = plan(reviewA, oldTarget);
     const planB = plan(reviewB, 'd'.repeat(40));
-    const controller = new ReviewCommentController(storage);
+    const anchorResolver = new ReviewAnchorResolver({
+        async getFileContentResult(_document, filePath) {
+            return {
+                status: 'available',
+                content: filePath === 'renamed.txt' ? 'current\n' : 'one\ntwo\nthree\nfour\nowned\n',
+            };
+        },
+    }, storage);
+    const controller = new ReviewCommentController(storage, anchorResolver);
+    anchorResolver.applyPreparedState(await anchorResolver.prepare(planA, [{
+        status: 'modified', filePath: 'old.txt',
+    }]));
     controller.setReviewableFiles(['old.txt']);
     controller.loadAllThreads(planA);
     const uriA = getDiffDocumentUri(
@@ -994,8 +1043,16 @@ test('comment mutations stay in their owning UUID bucket and branch threads rema
         planA.worktreeRoot
     );
     const range = new vscode.Range(4, 0, 4, 0);
+    vscode.workspace.openTextDocument = async uri => ({
+        uri,
+        lineCount: 5,
+        lineAt(line) {
+            const text = ['one', 'two', 'three', 'four', 'owned'][line];
+            return { text, range: { end: { character: text.length } } };
+        },
+    });
     const pendingReviewId = controller.captureNewThreadReviewId(uriA, 'old.txt');
-    controller.createThread(uriA, range, 'owned by A', 'old.txt');
+    await controller.createThread(uriA, range, 'owned by A', 'old.txt');
     const ownedThread = vscode.__createdCommentThreads.at(-1);
     let commentsA = storage.loadCommentsForReview(reviewA.id);
     assert.equal(commentsA.threads.length, 1);
@@ -1005,10 +1062,36 @@ test('comment mutations stay in their owning UUID bucket and branch threads rema
         filePath: 'old.txt',
     });
 
+    let releasePendingDocument;
+    let pendingDocumentStarted;
+    const pendingStarted = new Promise(resolve => { pendingDocumentStarted = resolve; });
+    const pendingDocument = new Promise(resolve => { releasePendingDocument = resolve; });
+    vscode.workspace.openTextDocument = async uri => {
+        pendingDocumentStarted();
+        await pendingDocument;
+        return {
+            uri,
+            lineCount: 5,
+            lineAt(line) {
+                const text = ['one', 'two', 'three', 'four', 'owned'][line];
+                return { text, range: { end: { character: text.length } } };
+            },
+        };
+    };
+    const delayedSubmission = controller.createThread(
+        uriA, range, 'delayed owned by A', 'old.txt', undefined, pendingReviewId
+    );
+    await pendingStarted;
+
     manager.setActiveReview(reviewB.id);
+    anchorResolver.applyPreparedState(await anchorResolver.prepare(planB, [{
+        status: 'modified', filePath: 'old.txt',
+    }]));
     controller.setReviewableFiles(['old.txt']);
     controller.loadAllThreads(planB);
-    assert.throws(() => controller.createThread(
+    releasePendingDocument();
+    await assert.rejects(delayedSubmission, /active review changed|prepared diff target/);
+    await assert.rejects(controller.createThread(
         uriA,
         range,
         'late pending A submission',
@@ -1055,15 +1138,17 @@ test('comment mutations stay in their owning UUID bucket and branch threads rema
     );
 
     const refreshedPlan = plan(reviewA, newTarget);
-    const beforePinnedLoad = vscode.__createdCommentThreads.length;
+    anchorResolver.applyPreparedState(await anchorResolver.prepare(refreshedPlan, [{
+        status: 'renamed', filePath: 'renamed.txt', oldFilePath: 'old.txt',
+    }]));
+    const beforeRefreshedLoad = vscode.__createdCommentThreads.length;
     controller.setReviewableFiles(['renamed.txt']);
     controller.loadAllThreads(refreshedPlan);
-    const pinnedThreads = vscode.__createdCommentThreads.slice(beforePinnedLoad);
-    assert.equal(pinnedThreads.length, 1);
-    const pinnedParams = new URLSearchParams(pinnedThreads[0].uri.query);
-    assert.equal(pinnedParams.get('ref'), oldTarget);
-    assert.equal(pinnedParams.get('reviewId'), reviewA.id);
-    assert.equal(pinnedThreads[0].uri.path, '/old.txt');
+    assert.equal(
+        vscode.__createdCommentThreads.length,
+        beforeRefreshedLoad,
+        'historical placement is diagnostic only and renames are not followed'
+    );
     const currentUri = getDiffDocumentUri(
         refreshedPlan.right,
         'renamed.txt',
@@ -1072,7 +1157,7 @@ test('comment mutations stay in their owning UUID bucket and branch threads rema
         refreshedPlan.worktreeRoot
     );
     controller.loadThreadsForFile(currentUri, 'renamed.txt', refreshedPlan);
-    assert.equal(vscode.__createdCommentThreads.length, beforePinnedLoad + 1);
+    assert.equal(vscode.__createdCommentThreads.length, beforeRefreshedLoad);
 
     const gitService = {
         async getChangedFiles() {
@@ -1083,7 +1168,9 @@ test('comment mutations stay in their owning UUID bucket and branch threads rema
         },
         getFileDiffUris,
     };
-    const provider = new ChangedFilesProvider(gitService, storage, manager);
+    const provider = new ChangedFilesProvider(
+        gitService, storage, manager, anchorResolver
+    );
     assert.equal(await provider.refresh(refreshedPlan), true);
     provider.getChildren();
     assert.equal(provider.getAllFileItems()[0].commentCount, 0);
@@ -1097,6 +1184,9 @@ test('comment mutations stay in their owning UUID bucket and branch threads rema
         'current comment',
         'test'
     );
+    anchorResolver.applyPreparedState(await anchorResolver.prepare(refreshedPlan, [{
+        status: 'renamed', filePath: 'renamed.txt', oldFilePath: 'old.txt',
+    }]));
     assert.equal(await provider.refresh(refreshedPlan), true);
     provider.getChildren();
     assert.equal(provider.getAllFileItems()[0].commentCount, 1);

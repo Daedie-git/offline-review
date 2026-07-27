@@ -8,6 +8,7 @@ export type CodeCommentTreeItem = CodeCommentFileItem | CodeCommentThreadItem;
 export class WorkspaceCommentsProvider implements vscode.TreeDataProvider<CodeCommentTreeItem> {
     private readonly _onDidChangeTreeData = new vscode.EventEmitter<CodeCommentTreeItem | undefined>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+    private reports: readonly WorkspaceThreadReport[] | undefined;
 
     constructor(
         private readonly storage: WorkspaceCommentStorage,
@@ -19,7 +20,7 @@ export class WorkspaceCommentsProvider implements vscode.TreeDataProvider<CodeCo
     }
 
     getChildren(element?: CodeCommentTreeItem): CodeCommentTreeItem[] {
-        const reports = this.storage.getReports();
+        const reports = this.reports ??= this.storage.getReports();
         if (element instanceof CodeCommentFileItem) {
             return reports
                 .filter(report => report.filePath === element.filePath)
@@ -41,6 +42,7 @@ export class WorkspaceCommentsProvider implements vscode.TreeDataProvider<CodeCo
     }
 
     refresh(): void {
+        this.reports = undefined;
         this._onDidChangeTreeData.fire(undefined);
     }
 
@@ -57,14 +59,20 @@ export class CodeCommentFileItem extends vscode.TreeItem {
         super(filePath, vscode.TreeItemCollapsibleState.Expanded);
         const unresolved = reports.filter(report => report.state === 'unresolved').length;
         const unavailable = reports.filter(report => report.pathStatus !== 'current').length;
-        const outOfRange = reports.filter(report => report.rangeStatus === 'outOfRange').length;
+        const stale = reports.filter(report => report.rangeStatus === 'stale').length;
+        const ambiguous = reports.filter(report => report.rangeStatus === 'ambiguous').length;
+        const reanchored = reports.filter(report => report.rangeStatus === 'reanchored').length;
         const health = [
             unavailable ? `${unavailable} missing/unsafe` : '',
-            outOfRange ? `${outOfRange} out of range` : '',
+            stale ? `${stale} stale` : '',
+            ambiguous ? `${ambiguous} ambiguous` : '',
+            reanchored ? `${reanchored} reanchored` : '',
         ].filter(Boolean).join(' · ');
         this.description = `${unresolved} unresolved${health ? ` · ${health}` : ''}`;
         this.tooltip = filePath;
-        this.iconPath = new vscode.ThemeIcon(unavailable || outOfRange ? 'warning' : 'file');
+        this.iconPath = new vscode.ThemeIcon(
+            unavailable || stale || ambiguous ? 'warning' : 'file'
+        );
         this.contextValue = 'codeCommentFile';
     }
 }
@@ -75,16 +83,16 @@ export class CodeCommentThreadItem extends vscode.TreeItem {
         pathResolver: WorkspacePathResolver
     ) {
         super(summary(report), vscode.TreeItemCollapsibleState.None);
-        const range = report.startLine === report.endLine
-            ? `line ${report.startLine + 1}`
-            : `lines ${report.startLine + 1}-${report.endLine + 1}`;
+        const displayStart = report.effectiveStartLine ?? report.startLine;
+        const displayEnd = report.effectiveEndLine ?? report.endLine;
+        const range = displayStart === displayEnd
+            ? `line ${displayStart + 1}`
+            : `lines ${displayStart + 1}-${displayEnd + 1}`;
         const health = report.pathStatus !== 'current'
             ? report.pathStatus
-            : report.rangeStatus === 'outOfRange'
-                ? 'out of range'
-                : report.stale ? 'stale' : undefined;
+            : report.rangeStatus === 'current' ? undefined : report.rangeStatus;
         this.description = [report.state, range, health].filter(Boolean).join(' · ');
-        this.tooltip = `${report.filePath}:${report.startLine + 1}`;
+        this.tooltip = `${report.filePath}:${displayStart + 1}`;
         this.iconPath = new vscode.ThemeIcon(
             report.pathStatus !== 'current' || report.rangeStatus !== 'current'
                 ? 'warning'
@@ -92,7 +100,7 @@ export class CodeCommentThreadItem extends vscode.TreeItem {
         );
         this.contextValue = 'codeCommentThread';
         const uri = pathResolver.uriForStoredPath(report.filePath);
-        if (uri && report.rangeStatus !== 'outOfRange') {
+        if (uri && (report.anchorStatus === 'current' || report.anchorStatus === 'reanchored')) {
             this.command = {
                 command: 'localPrReview.openCodeComment',
                 title: 'Open Code Comment',

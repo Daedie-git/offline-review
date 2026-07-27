@@ -2,14 +2,16 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { StorageService } from '../storage/storageService';
 import { GitService } from '../git/gitService';
+import { isEffectiveReviewProjection, ReviewAnchorResolver } from '../comments/reviewAnchorResolver';
 
 export class ReviewFileDecorationProvider implements vscode.FileDecorationProvider {
     private _onDidChangeFileDecorations = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>();
     readonly onDidChangeFileDecorations = this._onDidChangeFileDecorations.event;
 
     constructor(
-        private readonly storageService: StorageService,
-        private readonly gitService: GitService
+        _storageService: StorageService,
+        private readonly gitService: GitService,
+        private readonly anchorResolver?: ReviewAnchorResolver
     ) {}
 
     provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
@@ -43,13 +45,14 @@ export class ReviewFileDecorationProvider implements vscode.FileDecorationProvid
     }
 
     private getUnresolvedCount(filePath: string): number {
-        const comments = this.storageService.loadComments();
-        if (!comments) {
+        const state = this.anchorResolver?.getAppliedState();
+        if (!state || state.plan.worktreeRoot !== this.gitService.getSelectedWorktreeRoot()) {
             return 0;
         }
-
-        return comments.threads.filter(
-            t => t.filePath === filePath && t.state === 'unresolved'
+        return state.projections.filter(projection =>
+            projection.thread.filePath === filePath
+            && projection.thread.state === 'unresolved'
+            && isEffectiveReviewProjection(projection)
         ).length;
     }
 

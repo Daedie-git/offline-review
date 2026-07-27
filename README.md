@@ -54,6 +54,7 @@ Install directly from the [VS Code Marketplace](https://marketplace.visualstudio
 - **Open File** - Quick action to open the working copy from the diff view
 - **Multiple Reviews** - Save and switch between review sessions
 - **Workspace Code Comments** - Add persistent comments in ordinary editors without creating or activating a review
+- **Safe Re-anchoring** - Workspace, uncommitted, and branch-review comments follow uniquely moved exact source anchors without fuzzy guesses
 - **Copilot Integration** - Query diff comments with `#offlineReviewComments` and workspace comments with `#offlineCodeComments`
 - **Independent Storage** - Reviews keep UUID-backed v2 buckets; workspace comments use one separate v1 file under `.vscode/local-reviews/`
 
@@ -77,9 +78,11 @@ Worktree selection is session-only: Offline Review never switches or opens a VS 
 
 Open a regular file in the original Git workspace, select a line or range, and use the editor gutter's comment action. These threads appear in **Offline Review → Code Comments** even when no review is active. Linked-worktree files, virtual documents, files outside the workspace, symlink escapes, and `.vscode/local-reviews/` storage files are intentionally rejected.
 
-Workspace threads are stored in `.vscode/local-reviews/workspace-comments.json` (schema v1), independently from review comments in `.vscode/local-reviews/reviews/<review UUID>/comments.json` (schema v2). **Clear Workspace Comments** affects only the workspace file; clearing or deleting reviews never affects it. Missing files remain listed, and changed source anchors are marked stale.
+Workspace threads are stored in `.vscode/local-reviews/workspace-comments.json` (schema v1), independently from review comments in `.vscode/local-reviews/reviews/<review UUID>/comments.json` (schema v2). **Clear Workspace Comments** affects only the workspace file; clearing or deleting reviews never affects it. Missing files remain listed.
 
-Use `#offlineCodeComments` to retrieve structured workspace threads with exact paths, ranges, anchors, and missing/stale status. A separate `address-code-comments` agent skill can be installed under `~/.agents/skills/address-code-comments/`; it lists unresolved threads and safely appends replies/resolves successfully addressed thread UUIDs without touching review buckets. The skill is intentionally installed outside this extension repository and is not included in the VSIX.
+All three comment modes use the same conservative re-anchoring rule. If the authored text still matches its original range, the thread stays there. Otherwise, one exact line-sequence match in the same file and review side is shown as re-anchored at its effective range. Zero matches are stale, and multiple matches are ambiguous; the extension never chooses a nearest or fuzzy match and does not automatically follow file renames. Authored paths, targets, and ranges remain persisted unchanged while effective placements are computed read-only for the current workspace or review plan.
+
+Use `#offlineCodeComments` to retrieve structured workspace threads with authored/effective ranges, exact anchors, and missing/stale/ambiguous status. `#offlineReviewComments` reports the equivalent current-plan status for branch and uncommitted review threads. A separate `address-code-comments` agent skill can be installed under `~/.agents/skills/address-code-comments/`; it lists unresolved threads and safely appends replies/resolves successfully addressed thread UUIDs without touching review buckets. The skill is intentionally installed outside this extension repository and is not included in the VSIX.
 
 ## Architecture
 

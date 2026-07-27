@@ -69,7 +69,8 @@ function acquire(lockPath, verifyDirectory) {
             verifyDirectory();
             const record = { pid: process.pid, createdAt: Date.now(), token };
             fs.writeFileSync(descriptor, `${JSON.stringify(record)}\n`, 'utf8');
-            fs.fsyncSync(descriptor);
+            // The lock is live coordination only. Comment-data crash durability is
+            // established by the separate temporary/publication directory milestones.
             verifyDirectory();
             return { descriptor, token };
         }

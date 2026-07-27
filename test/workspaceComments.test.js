@@ -63,6 +63,58 @@ function document(filePath, content) {
     };
 }
 
+test('workspace creation reuses exact open documents and validates cold fallback ownership', async () => {
+    const { workspace, resolver, storage } = fixture();
+    const filePath = write(workspace, 'src/create.ts', 'first\nsecond');
+    const textDocument = document(filePath, 'first\nsecond');
+    const { AuthorIdentity } = built('authorIdentity');
+    const { WorkspaceCommentController } = built('workspaceComments/controller');
+    const { addOrReplyWorkspaceComment } = built('extension');
+    const controller = new WorkspaceCommentController(
+        storage,
+        resolver,
+        new AuthorIdentity({ USERNAME: 'workspace-user' })
+    );
+    const pending = () => ({
+        thread: {
+            uri: textDocument.uri,
+            range: new vscode.Range(0, 0, 0, 0),
+            comments: [],
+            dispose() {},
+        },
+        text: 'body',
+    });
+
+    let openCalls = 0;
+    vscode.workspace.textDocuments = [textDocument];
+    vscode.workspace.openTextDocument = async () => {
+        openCalls++;
+        return textDocument;
+    };
+    await addOrReplyWorkspaceComment(controller, pending());
+    assert.equal(openCalls, 0, 'an exact warm workspace document is reused');
+
+    vscode.workspace.textDocuments = [];
+    await addOrReplyWorkspaceComment(controller, pending());
+    assert.equal(openCalls, 1, 'a cold workspace document uses one fallback open');
+    assert.deepEqual(
+        storage.load().threads.flatMap(thread =>
+            thread.comments.map(comment => comment.author)
+        ),
+        ['workspace-user', 'workspace-user']
+    );
+
+    vscode.workspace.openTextDocument = async () => {
+        openCalls++;
+        return document(path.join(workspace, 'src/other.ts'), 'other');
+    };
+    await assert.rejects(
+        addOrReplyWorkspaceComment(controller, pending()),
+        /document changed while it was opening/
+    );
+    assert.equal(storage.load().threads.length, 2, 'mismatched fallback cannot create a thread');
+});
+
 test('workspace path authorization rejects lexical and canonical aliases and Git/storage boundaries', () => {
     const { workspace, resolver } = fixture();
     const inside = write(workspace, 'src/inside.ts', 'inside\n');
@@ -132,6 +184,7 @@ test('fresh storage children are descriptor-bound and parent-synced before desce
     const { WorkspacePathResolver } = built('workspaceComments/pathResolver');
     const { WorkspaceCommentStorage } = built('workspaceComments/storage');
     const storage = new WorkspaceCommentStorage(workspace, new WorkspacePathResolver(workspace));
+    write(workspace, 'src/fresh.ts', 'fresh\n');
     const originalMkdir = fs.mkdirSync;
     const originalFsync = fs.fsyncSync;
     const events = [];
@@ -151,7 +204,7 @@ test('fresh storage children are descriptor-bound and parent-synced before desce
         return originalFsync(descriptor);
     };
     try {
-        assert.deepEqual(storage.load(), { version: 1, threads: [] });
+        storage.addThread('src/fresh.ts', 0, 0, 'fresh', 'comment', 'tester');
     } finally {
         fs.mkdirSync = originalMkdir;
         fs.fsyncSync = originalFsync;
@@ -175,6 +228,7 @@ test('parent fsync preflight failure prevents fresh child publication', () => {
     const { WorkspacePathResolver } = built('workspaceComments/pathResolver');
     const { WorkspaceCommentStorage } = built('workspaceComments/storage');
     const storage = new WorkspaceCommentStorage(workspace, new WorkspacePathResolver(workspace));
+    write(workspace, 'src/sync.ts', 'sync\n');
     const originalFsync = fs.fsyncSync;
     fs.fsyncSync = descriptor => {
         if (fs.fstatSync(descriptor).isDirectory()
@@ -186,7 +240,10 @@ test('parent fsync preflight failure prevents fresh child publication', () => {
         return originalFsync(descriptor);
     };
     try {
-        assert.throws(() => storage.load(), /directory could not be synced/);
+        assert.throws(
+            () => storage.addThread('src/sync.ts', 0, 0, 'sync', 'comment', 'tester'),
+            /directory could not be synced/
+        );
     } finally {
         fs.fsyncSync = originalFsync;
     }
@@ -428,6 +485,7 @@ test('invalid scratch temporaries are retired when no recoverable store exists',
     const { storage } = fixture();
     assert.deepEqual(storage.load(), { version: 1, threads: [] });
     const directory = path.dirname(storage.filePath);
+    fs.mkdirSync(directory, { recursive: true });
     const scratch = [
         ['.workspace-comments.json.dead-empty.tmp', Buffer.alloc(0)],
         ['.workspace-comments.json.dead-truncated.tmp', Buffer.from('{"threads":[')],
@@ -488,6 +546,8 @@ test('replacement publication syncs displacement, publication, and backup retire
     const originalUnlink = fs.unlinkSync;
     const originalFsync = fs.fsyncSync;
     const events = [];
+    let fsyncCount = 0;
+    let hardLinkProbeCount = 0;
     const isDirectoryDescriptor = descriptor => {
         try {
             return fs.fstatSync(descriptor).isDirectory();
@@ -503,6 +563,9 @@ test('replacement publication syncs displacement, publication, and backup retire
         return originalRename(oldPath, newPath);
     };
     fs.linkSync = (oldPath, newPath) => {
+        if (String(newPath).endsWith('.link-probe.linked')) {
+            hardLinkProbeCount++;
+        }
         if (path.basename(String(newPath)) === 'workspace-comments.json') {
             events.push('publish');
         }
@@ -515,6 +578,7 @@ test('replacement publication syncs displacement, publication, and backup retire
         return originalUnlink(filePath);
     };
     fs.fsyncSync = descriptor => {
+        fsyncCount++;
         if (isDirectoryDescriptor(descriptor)) {
             events.push('dir-sync');
         }
@@ -534,9 +598,49 @@ test('replacement publication syncs displacement, publication, and backup retire
     assert.ok(events.slice(displacement + 1, publication).includes('dir-sync'), events.join(','));
     assert.ok(events.slice(publication + 1, retirement).includes('dir-sync'), events.join(','));
     assert.ok(events.slice(retirement + 1).includes('dir-sync'), events.join(','));
+    assert.equal(fsyncCount, 5, 'warm replacement keeps one file and four directory barriers');
+    assert.equal(events.filter(event => event === 'dir-sync').length, 4);
+    assert.equal(hardLinkProbeCount, 0, 'successful hard-link capability is cached by directory');
 });
 
-test('directory fsync preflight fails before creating any storage entry', () => {
+test('directory replacement invalidates cached sync and hard-link capabilities', () => {
+    const { workspace, storage } = fixture();
+    write(workspace, 'src/replaced-capabilities.ts', 'capabilities\n');
+    const thread = storage.addThread(
+        'src/replaced-capabilities.ts', 0, 0, 'capabilities', 'original', 'tester'
+    );
+    const directory = path.dirname(storage.filePath);
+    const displaced = `${directory}-old`;
+    const canonical = fs.readFileSync(storage.filePath);
+    fs.renameSync(directory, displaced);
+    fs.mkdirSync(directory, { mode: 0o700 });
+    fs.writeFileSync(storage.filePath, canonical, { mode: 0o600 });
+
+    const originalFsync = fs.fsyncSync;
+    const originalLink = fs.linkSync;
+    let fsyncCount = 0;
+    let hardLinkProbeCount = 0;
+    fs.fsyncSync = descriptor => {
+        fsyncCount++;
+        return originalFsync(descriptor);
+    };
+    fs.linkSync = (oldPath, newPath) => {
+        if (String(newPath).endsWith('.link-probe.linked')) {
+            hardLinkProbeCount++;
+        }
+        return originalLink(oldPath, newPath);
+    };
+    try {
+        storage.addReply(thread.id, 'new directory', 'tester');
+    } finally {
+        fs.fsyncSync = originalFsync;
+        fs.linkSync = originalLink;
+    }
+    assert.equal(fsyncCount, 7, 'a new directory identity reruns both capability preflights');
+    assert.equal(hardLinkProbeCount, 1);
+});
+
+test('warm temporary-name fsync failure leaves canonical and directory entries unchanged', () => {
     const { workspace, storage } = fixture();
     write(workspace, 'src/preflight-sync.ts', 'sync\n');
     const thread = storage.addThread(
@@ -771,10 +875,12 @@ test('directory replacement around sensitive stages never changes the replacemen
     }
 });
 
-test('unsupported hard links reject mutation before canonical displacement', () => {
-    const { workspace, storage } = fixture();
+test('unsupported hard links reject a cold storage session before canonical displacement', () => {
+    const { workspace, resolver, storage } = fixture();
     write(workspace, 'src/no-links.ts', 'links\n');
     const thread = storage.addThread('src/no-links.ts', 0, 0, 'links', 'original', 'tester');
+    const { WorkspaceCommentStorage } = built('workspaceComments/storage');
+    const coldStorage = new WorkspaceCommentStorage(workspace, resolver);
     const original = fs.readFileSync(storage.filePath);
     const originalLink = fs.linkSync;
     const originalRename = fs.renameSync;
@@ -795,7 +901,7 @@ test('unsupported hard links reject mutation before canonical displacement', () 
     };
     try {
         assert.throws(
-            () => storage.addReply(thread.id, 'must not move canonical', 'tester'),
+            () => coldStorage.addReply(thread.id, 'must not move canonical', 'tester'),
             /does not support safe hard-link publication/
         );
     } finally {
@@ -804,6 +910,37 @@ test('unsupported hard links reject mutation before canonical displacement', () 
     }
     assert.equal(canonicalDisplaced, false);
     assert.deepEqual(fs.readFileSync(storage.filePath), original);
+});
+
+test('warm publication link failure preserves durable temporary and backup', () => {
+    const { workspace, storage } = fixture();
+    write(workspace, 'src/link-failure.ts', 'link\n');
+    const thread = storage.addThread(
+        'src/link-failure.ts', 0, 0, 'link', 'original', 'tester'
+    );
+    const originalLink = fs.linkSync;
+    fs.linkSync = (oldPath, newPath) => {
+        if (path.basename(String(newPath)) === path.basename(storage.filePath)
+            && String(oldPath).endsWith('.tmp')) {
+            const error = new Error('injected publication link failure');
+            error.code = 'EIO';
+            throw error;
+        }
+        return originalLink(oldPath, newPath);
+    };
+    try {
+        assert.throws(
+            () => storage.addReply(thread.id, 'not published', 'tester'),
+            /publication link failure/
+        );
+    } finally {
+        fs.linkSync = originalLink;
+    }
+    const entries = fs.readdirSync(path.dirname(storage.filePath));
+    assert.equal(entries.some(name => name.endsWith('.backup')), true);
+    assert.equal(entries.some(name => name.endsWith('.tmp')), true);
+    assert.equal(fs.existsSync(storage.filePath), false);
+    assert.equal(storage.load().threads[0].comments.length, 1);
 });
 
 test('external atomic replacement after displacement is never overwritten', () => {
@@ -855,8 +992,9 @@ test('reports distinguish shortened ranges and preserve CRLF terminal blank-line
     write(workspace, 'src/short.ts', 'first');
     const report = storage.getReports()[0];
     assert.equal(report.pathStatus, 'current');
-    assert.equal(report.rangeStatus, 'outOfRange');
-    assert.equal(report.stale, false);
+    assert.equal(report.anchorStatus, 'notFound');
+    assert.equal(report.rangeStatus, 'stale');
+    assert.equal(report.stale, true);
 
     const crlfFile = write(workspace, 'src/crlf.ts', 'first\r\n\r\n');
     const blank = storage.addThread('src/crlf.ts', 2, 2, '', 'terminal blank', 'tester');
@@ -898,10 +1036,11 @@ test('controller skips invalid ranges, recreates moved IDs, and fails stale muta
     invalidData.threads.find(item => item.id === invalid.id).endLine = 5;
     fs.writeFileSync(storage.filePath, `${JSON.stringify(invalidData, null, 2)}\n`);
     controller.loadAllThreads();
-    assert.equal(
-        vscode.__createdCommentThreads.some(thread => thread.__workspaceThreadId === invalid.id),
-        false
+    const reanchored = vscode.__createdCommentThreads.find(
+        thread => thread.__workspaceThreadId === invalid.id
     );
+    assert.equal(reanchored.range.start.line, 0);
+    assert.equal(reanchored.range.end.line, 0);
     controller.dispose();
     void saved;
 });
@@ -912,7 +1051,13 @@ test('ordinary-editor controller and provider support healthy workspace comments
     const { WorkspaceCommentController } = built('workspaceComments/controller');
     const { WorkspaceCommentsProvider, CodeCommentThreadItem } = built('workspaceComments/provider');
     const controller = new WorkspaceCommentController(storage, resolver);
-    assert.equal(vscode.__createdCommentControllers.at(-1).id, 'localCodeComments');
+    const vscodeController = vscode.__createdCommentControllers.at(-1);
+    assert.equal(vscodeController.id, 'localCodeComments');
+    assert.equal(vscodeController.commentingRangeProviderAssignments, 1);
+    const initialRangeProvider = vscodeController.commentingRangeProvider;
+    controller.refreshCommentingRanges();
+    assert.equal(vscodeController.commentingRangeProviderAssignments, 2);
+    assert.equal(vscodeController.commentingRangeProvider, initialRangeProvider);
     const textDocument = document(filePath, 'alpha\nbeta\n');
     assert.equal(
         controller.controller.commentingRangeProvider.provideCommentingRanges(textDocument).length,
@@ -945,6 +1090,7 @@ test('ordinary-editor controller and provider support healthy workspace comments
     assert.equal(threadItems[0] instanceof CodeCommentThreadItem, true);
     assert.equal(threadItems[0].command.command, 'localPrReview.openCodeComment');
     fs.unlinkSync(filePath);
+    provider.refresh();
     const missingItem = provider.getChildren(provider.getChildren()[0])[0];
     assert.match(missingItem.description, /missing/);
     assert.equal(missingItem.command, undefined);
@@ -954,6 +1100,35 @@ test('ordinary-editor controller and provider support healthy workspace comments
     assert.equal(storage.load().threads.length, 1, 'missing threads stay persisted');
     provider.dispose();
     controller.dispose();
+});
+
+test('workspace tree uses one report snapshot per refresh generation', () => {
+    const { workspace, resolver, storage } = fixture();
+    write(workspace, 'src/a.ts', 'a\n');
+    write(workspace, 'src/b.ts', 'b\n');
+    storage.addThread('src/a.ts', 0, 0, 'a', 'A', 'tester');
+    storage.addThread('src/b.ts', 0, 0, 'b', 'B', 'tester');
+    const originalGetReports = storage.getReports.bind(storage);
+    let reportCalls = 0;
+    storage.getReports = () => {
+        reportCalls++;
+        return originalGetReports();
+    };
+
+    const { WorkspaceCommentsProvider } = built('workspaceComments/provider');
+    const provider = new WorkspaceCommentsProvider(storage, resolver);
+    const roots = provider.getChildren();
+    assert.equal(roots.length, 2);
+    assert.equal(reportCalls, 1);
+    for (const root of roots) {
+        assert.equal(provider.getChildren(root).length, 1);
+    }
+    provider.getChildren();
+    assert.equal(reportCalls, 1, 'root and every expanded file share one snapshot');
+
+    provider.refresh();
+    provider.getChildren();
+    assert.equal(reportCalls, 2, 'refresh invalidates exactly one provider generation');
 });
 
 test('code-comments tool filters safely without review-bucket changes', async () => {
@@ -981,4 +1156,89 @@ test('code-comments tool filters safely without review-bucket changes', async ()
     const invalid = await tool.invoke({ input: { filePath: '../tool.ts' } }, undefined);
     assert.match(invalid.content[0].value, /normalized path/);
     assert.equal(fs.readFileSync(reviewBucket, 'utf8'), reviewBefore);
+});
+
+test('workspace exact projections are read-only, cached, and hide stale or ambiguous inline threads', async () => {
+    const { workspace, resolver, storage } = fixture();
+    const movedPath = write(workspace, 'src/moved.ts', 'before\nneedle\nafter\n');
+    write(workspace, 'src/ambiguous.ts', 'duplicate\nx\nduplicate\n');
+    write(workspace, 'src/stale.ts', 'different\n');
+    const moved = storage.addThread(
+        'src/moved.ts', 0, 0, 'needle', 'moved comment', 'tester'
+    );
+    const movedAgain = storage.addThread(
+        'src/moved.ts', 9, 9, 'needle', 'same cached file', 'tester'
+    );
+    const ambiguous = storage.addThread(
+        'src/ambiguous.ts', 9, 9, 'duplicate', 'ambiguous comment', 'tester'
+    );
+    const stale = storage.addThread(
+        'src/stale.ts', 0, 0, 'missing anchor', 'stale comment', 'tester'
+    );
+    const before = fs.readFileSync(storage.filePath);
+    const originalRead = fs.readFileSync;
+    let movedReads = 0;
+    fs.readFileSync = (filePath, ...args) => {
+        if (String(filePath) === movedPath) {
+            movedReads++;
+        }
+        return originalRead(filePath, ...args);
+    };
+    let reports;
+    try {
+        reports = storage.getReports();
+    } finally {
+        fs.readFileSync = originalRead;
+    }
+    assert.equal(movedReads, 1, 'source content is read once per path per report call');
+    assert.deepEqual(fs.readFileSync(storage.filePath), before, 'projection does not rewrite v1');
+    const byId = new Map(reports.map(report => [report.id, report]));
+    assert.deepEqual(
+        [byId.get(moved.id).anchorStatus, byId.get(moved.id).rangeStatus,
+            byId.get(moved.id).effectiveStartLine],
+        ['reanchored', 'reanchored', 1]
+    );
+    assert.equal(byId.get(movedAgain.id).anchorStatus, 'reanchored');
+    assert.equal(byId.get(ambiguous.id).anchorStatus, 'ambiguous');
+    assert.equal(byId.get(ambiguous.id).matches.length, 2);
+    assert.equal(byId.get(stale.id).anchorStatus, 'notFound');
+    assert.equal(byId.get(stale.id).rangeStatus, 'stale');
+
+    const { WorkspaceCommentController } = built('workspaceComments/controller');
+    const controller = new WorkspaceCommentController(storage, resolver);
+    controller.loadAllThreads();
+    const rendered = vscode.__createdCommentThreads.filter(thread =>
+        thread.__workspaceThreadId === moved.id || thread.__workspaceThreadId === movedAgain.id
+    );
+    assert.equal(rendered.length, 2);
+    assert.equal(rendered.every(thread => thread.range.start.line === 1), true);
+    assert.equal(vscode.__createdCommentThreads.some(thread =>
+        thread.__workspaceThreadId === ambiguous.id || thread.__workspaceThreadId === stale.id
+    ), false);
+
+    const { WorkspaceCommentsProvider } = built('workspaceComments/provider');
+    const provider = new WorkspaceCommentsProvider(storage, resolver);
+    const movedFile = provider.getChildren().find(item => item.filePath === 'src/moved.ts');
+    const movedItem = provider.getChildren(movedFile).find(item => item.report.id === moved.id);
+    assert.match(movedItem.description, /line 2.*reanchored/);
+    assert.equal(movedItem.command.command, 'localPrReview.openCodeComment');
+    const ambiguousFile = provider.getChildren().find(item => item.filePath === 'src/ambiguous.ts');
+    assert.equal(provider.getChildren(ambiguousFile)[0].command, undefined);
+
+    const { WorkspaceCommentsTool } = built('workspaceComments/tool');
+    const payload = JSON.parse((await new WorkspaceCommentsTool(storage, resolver).invoke({
+        input: { filePath: 'src/moved.ts' },
+    }, undefined)).content[0].value);
+    assert.deepEqual(
+        [payload.threads[0].authoredStartLine, payload.threads[0].effectiveStartLine,
+            payload.threads[0].anchorStatus, payload.threads[0].rangeStatus],
+        [0, 1, 'reanchored', 'reanchored']
+    );
+
+    write(workspace, 'src/moved.ts', 'anchor removed\n');
+    controller.loadAllThreads();
+    assert.equal(rendered.every(thread => thread.disposed), true);
+    assert.deepEqual(fs.readFileSync(storage.filePath), before);
+    provider.dispose();
+    controller.dispose();
 });
