@@ -2,7 +2,7 @@
   "name": "offline-review",
   "displayName": "Offline Review",
   "description": "Review uncommitted changes and branch diffs locally with inline comments — no remote needed.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "Daedie",
   "author": "Daedie",
   "icon": "resources/icon.png",

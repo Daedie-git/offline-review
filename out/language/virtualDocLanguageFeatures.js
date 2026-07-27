@@ -33,27 +33,30 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.getLiveWorktreeUri = getLiveWorktreeUri;
 exports.registerVirtualDocLanguageFeatures = registerVirtualDocLanguageFeatures;
 const vscode = __importStar(require("vscode"));
 const gitService_1 = require("../git/gitService");
+/** Map only a live worktree virtual document to its captured on-disk file. */
+function getLiveWorktreeUri(virtualUri) {
+    const parsed = (0, gitService_1.parseDiffDocumentUri)(virtualUri);
+    if (!parsed || parsed.side !== 'modified'
+        || parsed.document.kind !== 'worktree' || !parsed.worktreeRoot) {
+        return undefined;
+    }
+    return vscode.Uri.joinPath(vscode.Uri.file(parsed.worktreeRoot), parsed.filePath);
+}
 /**
- * Forward language navigation from modified-side virtual documents to the
- * corresponding file in the checkout captured by the prepared DiffPlan.
- * Original/base snapshots are never forwarded because their line positions do
- * not describe the target file.
+ * Forward language navigation only from live WORKTREE documents to the
+ * corresponding file captured by the prepared DiffPlan. Immutable Git snapshots
+ * are not forwarded because their contents and line positions may differ from
+ * every checked-out file.
  */
 function registerVirtualDocLanguageFeatures(context, gitService) {
     const selector = { scheme: 'git-local-review' };
-    const toRealUri = (virtualUri) => {
-        const parsed = (0, gitService_1.parseDiffDocumentUri)(virtualUri);
-        if (!parsed || parsed.side !== 'modified' || !parsed.worktreeRoot) {
-            return undefined;
-        }
-        return vscode.Uri.joinPath(vscode.Uri.file(parsed.worktreeRoot), parsed.filePath);
-    };
     const ensureRealUri = async (virtualUri) => {
         const parsed = (0, gitService_1.parseDiffDocumentUri)(virtualUri);
-        const realUri = toRealUri(virtualUri);
+        const realUri = getLiveWorktreeUri(virtualUri);
         if (!parsed?.worktreeRoot || !realUri
             || !await gitService.isLinkedWorktreeRoot(parsed.worktreeRoot)) {
             return undefined;

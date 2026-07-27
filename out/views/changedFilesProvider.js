@@ -138,10 +138,12 @@ class ChangedFilesProvider {
         if (!comments) {
             return counts;
         }
+        const filesByPath = new Map(this.files.map(file => [file.filePath, file]));
         for (const thread of comments.threads) {
-            if (thread.state !== 'resolved'
-                && (0, types_1.isThreadCurrentForPlan)(thread, this.plan)) {
-                counts.set(thread.target.filePath, (counts.get(thread.target.filePath) ?? 0) + 1);
+            const file = filesByPath.get(thread.filePath);
+            if (file && thread.state !== 'resolved'
+                && (0, types_1.isThreadCurrentForPlan)(thread, this.plan, file.filePath, file.status === 'deleted' ? 'original' : 'modified')) {
+                counts.set(file.filePath, (counts.get(file.filePath) ?? 0) + 1);
             }
         }
         return counts;
@@ -327,6 +329,7 @@ class FileChangeItem extends vscode.TreeItem {
         this.commentCount = commentCount;
         this.leftUri = uris.left;
         this.rightUri = uris.right;
+        this.commentUri = fileChange.status === 'deleted' ? uris.left : uris.right;
         this.resourceUri = vscode.Uri.joinPath(vscode.Uri.file(diffPlan.worktreeRoot), fileChange.filePath);
         const statusLabel = fileChange.status.charAt(0).toUpperCase();
         const commentLabel = commentCount > 0

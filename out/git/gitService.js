@@ -46,6 +46,10 @@ const path = __importStar(require("path"));
 const MAX_GIT_OUTPUT = 10 * 1024 * 1024;
 const DEFAULT_GIT_TIMEOUT = 30000;
 const GIT_URI_SCHEME = 'git-local-review';
+const REVIEW_STORAGE_PATHS = [
+    '.vscode/local-reviews',
+    '.vscode/offline-review',
+];
 /** Build a virtual-document URI from an already resolved document decision. */
 function getDiffDocumentUri(document, filePath, side, reviewId, capturedWorktreeRoot) {
     const query = new URLSearchParams({
@@ -555,7 +559,10 @@ class GitService {
                 plan.headCommit,
                 '--',
             ], DEFAULT_GIT_TIMEOUT, plan.worktreeRoot);
-        const files = parseNameStatus(output);
+        // Review metadata is implementation state, never user-authored review
+        // content—even when the host repository does not ignore these paths.
+        const files = parseNameStatus(output).filter(change => !isReviewStoragePath(change.filePath)
+            && (!change.oldFilePath || !isReviewStoragePath(change.oldFilePath)));
         if (plan.kind === 'worktree') {
             const untrackedOutput = await this.execGit([
                 'ls-files',
@@ -566,7 +573,7 @@ class GitService {
             ], DEFAULT_GIT_TIMEOUT, plan.worktreeRoot);
             const seen = new Set(files.map(file => file.filePath));
             for (const filePath of splitNul(untrackedOutput)) {
-                if (!seen.has(filePath)) {
+                if (!isReviewStoragePath(filePath) && !seen.has(filePath)) {
                     files.push({ status: 'added', filePath });
                     seen.add(filePath);
                 }
@@ -887,6 +894,10 @@ function isSafeRelativeGitPath(filePath) {
         return false;
     }
     return !filePath.split(/[\\/]/).some(segment => segment === '..' || segment === '');
+}
+function isReviewStoragePath(filePath) {
+    const normalized = filePath.replace(/\\/g, '/').replace(/^\.\//, '');
+    return REVIEW_STORAGE_PATHS.some(storagePath => normalized === storagePath || normalized.startsWith(`${storagePath}/`));
 }
 function isPathInside(root, candidate, allowEqual = false) {
     const relative = path.relative(root, candidate);

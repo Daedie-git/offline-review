@@ -113,7 +113,8 @@ async function activate(context) {
                 changedFilesProvider.prepareRefresh(review),
                 gitService.getCurrentBranch(),
             ]);
-            if (generation !== transitionGeneration) {
+            if (generation !== transitionGeneration
+                || !localPrManager.getReviewById(review.id)) {
                 return false;
             }
             if (options.ensureCommentsFile !== false) {
@@ -124,7 +125,9 @@ async function activate(context) {
             if (prepared.plan.kind === 'branch') {
                 localPrManager.updateBranchReviewFallbackCommits(prepared.plan.reviewId, prepared.plan.baseCommit, prepared.plan.targetCommit);
             }
-            commentController.setReviewableFiles(prepared.files.map(file => file.filePath));
+            commentController.setReviewableFiles(prepared.files.map(file => file.filePath), prepared.files
+                .filter(file => file.status === 'deleted')
+                .map(file => file.filePath));
             commentController.loadAllThreads(prepared.plan);
             branchSelectorProvider.setReviewState({
                 review,
@@ -143,8 +146,11 @@ async function activate(context) {
             return false;
         }
     };
-    const clearReviewUi = async () => {
-        const generation = ++transitionGeneration;
+    const clearReviewUi = async (reservedGeneration) => {
+        const generation = reservedGeneration ?? ++transitionGeneration;
+        if (generation !== transitionGeneration) {
+            return;
+        }
         localPrManager.deactivateReview();
         changedFilesProvider.clear();
         commentController.setReviewableFiles([]);
@@ -324,50 +330,19 @@ async function activate(context) {
             }
         }
     };
-    const restoreModeAfterClear = async (mode, previous) => {
-        if (mode === 'uncommitted') {
-            if (await reviewUncommitted({ quiet: true }) === 'failed') {
-                await clearReviewUi();
-            }
-            return;
-        }
-        if (previous?.mode === 'branch') {
-            const generation = ++transitionGeneration;
-            try {
-                const review = await getOrCreateBranchReview(previous.baseBranch, previous.targetBranch);
-                if (await transitionToReview(review, { showError: false }, generation)) {
-                    return;
-                }
-                if (generation !== transitionGeneration) {
-                    return;
-                }
-            }
-            catch {
-                if (generation !== transitionGeneration) {
-                    return;
-                }
-                // Fall back to a review of the selected worktree's branch.
-            }
-        }
-        if (await reviewActiveBranch({ quiet: true }) === 'failed') {
-            await clearReviewUi();
-        }
-    };
     if (initialized) {
         const active = localPrManager.getActiveReview();
-        let restored = true;
-        if (localPrManager.getActiveMode() === 'uncommitted') {
-            // Local is the default worktree; never auto-checkout a saved branch.
-            restored = await reviewUncommitted({ quiet: true }) !== 'failed';
-        }
-        else if (active?.mode === 'branch') {
-            restored = await transitionToReview(active);
+        if (!active) {
+            await clearReviewUi();
         }
         else {
-            restored = await reviewActiveBranch({ quiet: true }) !== 'failed';
-        }
-        if (!restored) {
-            await clearReviewUi();
+            const restored = active.mode === 'uncommitted'
+                // Local is the default worktree; never auto-checkout a saved branch.
+                ? await reviewUncommitted({ quiet: true }) !== 'failed'
+                : await transitionToReview(active);
+            if (!restored) {
+                await clearReviewUi();
+            }
         }
     }
     let refreshTimer;
@@ -419,6 +394,13 @@ async function activate(context) {
         // original workspace while this coordinator refreshes the mode.
         const selectionGeneration = ++worktreeSelectionGeneration;
         void (async () => {
+            const initiatingReviewId = localPrManager.getActiveReview()?.id;
+            if (!initiatingReviewId) {
+                await clearReviewUi();
+                branchSelectorProvider.refresh();
+                fileDecorationProvider.refresh();
+                return;
+            }
             const applySelectedMode = () => localPrManager.getActiveMode() === 'uncommitted'
                 ? reviewUncommitted({ quiet: true })
                 : reviewActiveBranch({ quiet: true });
@@ -430,7 +412,11 @@ async function activate(context) {
             if (result === 'superseded'
                 && appliedPlan?.worktreeRoot !== gitService.getSelectedWorktreeRoot()) {
                 // A background event raced the selector. Retry once so the
-                // latest selected checkout remains authoritative.
+                // latest selected checkout remains authoritative, unless a
+                // destructive command deliberately made the UI inactive.
+                if (localPrManager.getActiveReview()?.id !== initiatingReviewId) {
+                    return;
+                }
                 result = await applySelectedMode();
                 if (selectionGeneration !== worktreeSelectionGeneration) {
                     return;
@@ -449,6 +435,10 @@ async function activate(context) {
         // Open worktree documents may survive checkouts; invalidate each
         // actual cached identity before preparing the next branch state.
         gitFileContentProvider.refreshAllWorkingTree(gitService.getSelectedWorktreeRoot());
+        if (!localPrManager.getActiveReview()) {
+            void clearReviewUi();
+            return;
+        }
         if (!branch) {
             // Reserve immediately so any in-flight transition for the former
             // branch cannot publish after the checkout becomes detached.
@@ -569,17 +559,20 @@ async function activate(context) {
             return;
         }
         const wasActive = localPrManager.getActiveReview()?.id === review.id;
-        transitionGeneration++;
-        await storageService.withWatchSuppressed(() => {
-            localPrManager.deleteReview(review.id);
-        });
         if (wasActive) {
-            await restoreModeAfterClear(review.mode, review);
+            const generation = ++transitionGeneration;
+            await storageService.withWatchSuppressed(async () => {
+                localPrManager.deleteReview(review.id);
+                await clearReviewUi(generation);
+            });
         }
         else {
-            localPrsProvider.refresh();
-            localCommentsProvider.refresh();
-            fileDecorationProvider.refresh();
+            await storageService.withWatchSuppressed(() => {
+                localPrManager.deleteReview(review.id);
+                localPrsProvider.refresh();
+                localCommentsProvider.refresh();
+                fileDecorationProvider.refresh();
+            });
         }
     }), vscode.commands.registerCommand('localPrReview.clearActiveReview', async () => {
         const active = localPrManager.getActiveReview();
@@ -595,30 +588,28 @@ async function activate(context) {
             vscode.window.showInformationMessage('The active review changed; nothing was cleared.');
             return;
         }
-        transitionGeneration++;
-        await storageService.withWatchSuppressed(() => {
+        const generation = ++transitionGeneration;
+        await storageService.withWatchSuppressed(async () => {
             localPrManager.deleteReview(active.id);
+            await clearReviewUi(generation);
         });
-        await restoreModeAfterClear(active.mode, active);
-        vscode.window.showInformationMessage('Active review comments cleared.');
+        vscode.window.showInformationMessage('Active review cleared.');
     }), vscode.commands.registerCommand('localPrReview.clearAllReviews', async () => {
         const count = localPrManager.listReviews().length;
         if (count === 0) {
             vscode.window.showInformationMessage('No reviews to clear.');
             return;
         }
-        const active = localPrManager.getActiveReview();
-        const mode = active?.mode ?? localPrManager.getActiveMode();
         const answer = await vscode.window.showWarningMessage(`Clear all ${count} offline review${count === 1 ? '' : 's'} and their comments?`, { modal: true }, 'Clear all');
         if (answer !== 'Clear all') {
             return;
         }
-        transitionGeneration++;
-        await storageService.withWatchSuppressed(() => {
+        const generation = ++transitionGeneration;
+        await storageService.withWatchSuppressed(async () => {
             localPrManager.clearAllReviews();
+            await clearReviewUi(generation);
         });
-        await restoreModeAfterClear(mode, active);
-        vscode.window.showInformationMessage('All review comments cleared.');
+        vscode.window.showInformationMessage('All reviews and comments cleared.');
     }));
     context.subscriptions.push(vscode.commands.registerCommand('localPrReview.refreshFiles', async () => {
         const plan = changedFilesProvider.getDiffPlan();
@@ -626,11 +617,15 @@ async function activate(context) {
             gitFileContentProvider.refreshAllWorkingTree(plan.worktreeRoot);
         }
         const active = localPrManager.getActiveReview();
-        if (active?.mode === 'branch'
+        if (!active) {
+            vscode.window.showInformationMessage('No active review. Choose a review mode to create one.');
+            return;
+        }
+        if (active.mode === 'branch'
             && plan?.worktreeRoot === gitService.getSelectedWorktreeRoot()) {
             await transitionToReview(active, { showError: false });
         }
-        else if (localPrManager.getActiveMode() === 'uncommitted') {
+        else if (active.mode === 'uncommitted') {
             await reviewUncommitted({ quiet: true });
         }
         else {
@@ -657,7 +652,7 @@ async function activate(context) {
             ? `${item.fileChange.filePath} (${(0, types_1.formatReviewLabel)(review)})`
             : item.fileChange.filePath;
         await vscode.commands.executeCommand('vscode.diff', item.leftUri, item.rightUri, title);
-        commentController.loadThreadsForFile(item.rightUri, item.fileChange.filePath, item.diffPlan);
+        commentController.loadThreadsForFile(item.commentUri, item.fileChange.filePath, item.diffPlan);
     }), vscode.commands.registerCommand('localPrReview.openAllDiffs', async () => {
         const files = changedFilesProvider.getAllFileItems();
         if (files.length === 0) {

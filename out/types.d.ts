@@ -110,9 +110,11 @@ export interface PreparedDiffState {
 }
 export interface GitThreadTarget {
     readonly kind: 'git';
-    /** Immutable target commit on which the thread was authored. */
+    /** Immutable commit on which the thread was authored. */
     readonly ref: string;
-    /** Path as it existed in the immutable target snapshot. */
+    /** Existing v2 targets omit this and are interpreted as modified/right. */
+    readonly side?: 'original' | 'modified';
+    /** Path as it existed in the immutable snapshot. */
     readonly filePath: string;
 }
 export interface WorktreeThreadTarget {
@@ -148,7 +150,7 @@ export interface CommentsFile {
     targetCommit: string;
     threads: ReviewThread[];
 }
-export declare function isThreadCurrentForPlan(thread: ReviewThread, plan: DiffPlan, filePath?: string): boolean;
+export declare function isThreadCurrentForPlan(thread: ReviewThread, plan: DiffPlan, filePath?: string, expectedSide?: 'original' | 'modified'): boolean;
 export interface LocalPrRegistry {
     version: 2;
     reviews: LocalPr[];

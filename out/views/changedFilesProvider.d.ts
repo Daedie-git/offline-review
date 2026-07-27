@@ -67,6 +67,7 @@ export declare class FileChangeItem extends vscode.TreeItem {
     readonly commentCount: number;
     readonly leftUri: vscode.Uri;
     readonly rightUri: vscode.Uri;
+    readonly commentUri: vscode.Uri;
     constructor(fileChange: FileChange, diffPlan: DiffPlan, uris: FileDiffUris, commentCount?: number, useBasename?: boolean);
 }
 export declare class CommitItem extends vscode.TreeItem {

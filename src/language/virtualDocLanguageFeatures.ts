@@ -1,11 +1,21 @@
 import * as vscode from 'vscode';
 import { GitService, parseDiffDocumentUri } from '../git/gitService';
 
+/** Map only a live worktree virtual document to its captured on-disk file. */
+export function getLiveWorktreeUri(virtualUri: vscode.Uri): vscode.Uri | undefined {
+    const parsed = parseDiffDocumentUri(virtualUri);
+    if (!parsed || parsed.side !== 'modified'
+        || parsed.document.kind !== 'worktree' || !parsed.worktreeRoot) {
+        return undefined;
+    }
+    return vscode.Uri.joinPath(vscode.Uri.file(parsed.worktreeRoot), parsed.filePath);
+}
+
 /**
- * Forward language navigation from modified-side virtual documents to the
- * corresponding file in the checkout captured by the prepared DiffPlan.
- * Original/base snapshots are never forwarded because their line positions do
- * not describe the target file.
+ * Forward language navigation only from live WORKTREE documents to the
+ * corresponding file captured by the prepared DiffPlan. Immutable Git snapshots
+ * are not forwarded because their contents and line positions may differ from
+ * every checked-out file.
  */
 export function registerVirtualDocLanguageFeatures(
     context: vscode.ExtensionContext,
@@ -13,17 +23,9 @@ export function registerVirtualDocLanguageFeatures(
 ): void {
     const selector: vscode.DocumentSelector = { scheme: 'git-local-review' };
 
-    const toRealUri = (virtualUri: vscode.Uri): vscode.Uri | undefined => {
-        const parsed = parseDiffDocumentUri(virtualUri);
-        if (!parsed || parsed.side !== 'modified' || !parsed.worktreeRoot) {
-            return undefined;
-        }
-        return vscode.Uri.joinPath(vscode.Uri.file(parsed.worktreeRoot), parsed.filePath);
-    };
-
     const ensureRealUri = async (virtualUri: vscode.Uri): Promise<vscode.Uri | undefined> => {
         const parsed = parseDiffDocumentUri(virtualUri);
-        const realUri = toRealUri(virtualUri);
+        const realUri = getLiveWorktreeUri(virtualUri);
         if (!parsed?.worktreeRoot || !realUri
             || !await gitService.isLinkedWorktreeRoot(parsed.worktreeRoot)) {
             return undefined;

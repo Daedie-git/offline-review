@@ -7,10 +7,12 @@ export declare class ReviewCommentController {
     private readonly threads;
     private readonly commentIdentities;
     private readonly reviewableFiles;
+    private readonly originalSideFiles;
     private activePlan;
     constructor(storageService: StorageService);
-    setReviewableFiles(filePaths: readonly string[]): void;
-    /** Load one file's threads only on the exact modified/right URI. */
+    setReviewableFiles(filePaths: readonly string[], originalSideFilePaths?: readonly string[]): void;
+    private currentTargetUri;
+    /** Load one file's threads only on its exact reviewable diff side. */
     loadThreadsForFile(targetUri: vscode.Uri, filePath: string, plan?: DiffPlan | undefined): void;
     /**
      * Replace all loaded threads using the exact target document in a prepared

@@ -25,15 +25,23 @@ function formatReviewLabel(review) {
         ? `uncommitted (${review.branch})`
         : `${review.targetBranch} vs ${review.baseBranch}`;
 }
-function isThreadCurrentForPlan(thread, plan, filePath = thread.filePath) {
+function isThreadCurrentForPlan(thread, plan, filePath = thread.filePath, expectedSide = 'modified') {
     const target = thread.target;
     if (target.filePath !== filePath) {
         return false;
     }
-    return plan.kind === 'branch'
-        ? target.kind === 'git' && target.ref === plan.targetCommit
-        : target.kind === 'worktree'
-            && target.reviewId === plan.reviewId
-            && target.headCommit === plan.headCommit;
+    if ((target.kind === 'git' ? target.side ?? 'modified' : 'modified') !== expectedSide) {
+        return false;
+    }
+    if (target.kind === 'git') {
+        const expectedRef = expectedSide === 'original'
+            ? plan.kind === 'branch' ? plan.mergeBaseCommit : plan.headCommit
+            : plan.kind === 'branch' ? plan.targetCommit : undefined;
+        return expectedRef !== undefined && target.ref === expectedRef;
+    }
+    return expectedSide === 'modified'
+        && plan.kind === 'worktree'
+        && target.reviewId === plan.reviewId
+        && target.headCommit === plan.headCommit;
 }
 //# sourceMappingURL=types.js.map

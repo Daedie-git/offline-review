@@ -153,12 +153,19 @@ export class ChangedFilesProvider implements vscode.TreeDataProvider<ChangedFile
         if (!comments) {
             return counts;
         }
+        const filesByPath = new Map(this.files.map(file => [file.filePath, file]));
         for (const thread of comments.threads) {
-            if (thread.state !== 'resolved'
-                && isThreadCurrentForPlan(thread, this.plan)) {
+            const file = filesByPath.get(thread.filePath);
+            if (file && thread.state !== 'resolved'
+                && isThreadCurrentForPlan(
+                    thread,
+                    this.plan,
+                    file.filePath,
+                    file.status === 'deleted' ? 'original' : 'modified'
+                )) {
                 counts.set(
-                    thread.target.filePath,
-                    (counts.get(thread.target.filePath) ?? 0) + 1
+                    file.filePath,
+                    (counts.get(file.filePath) ?? 0) + 1
                 );
             }
         }
@@ -357,6 +364,7 @@ export class FolderItem extends vscode.TreeItem {
 export class FileChangeItem extends vscode.TreeItem {
     readonly leftUri: vscode.Uri;
     readonly rightUri: vscode.Uri;
+    readonly commentUri: vscode.Uri;
 
     constructor(
         public readonly fileChange: FileChange,
@@ -371,6 +379,7 @@ export class FileChangeItem extends vscode.TreeItem {
         super(displayName, vscode.TreeItemCollapsibleState.None);
         this.leftUri = uris.left;
         this.rightUri = uris.right;
+        this.commentUri = fileChange.status === 'deleted' ? uris.left : uris.right;
 
         this.resourceUri = vscode.Uri.joinPath(
             vscode.Uri.file(diffPlan.worktreeRoot),

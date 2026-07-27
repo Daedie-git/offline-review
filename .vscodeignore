@@ -4,6 +4,7 @@ src/**
 test/**
 *.vsix
 bug.md
+review-*.md
 .gitignore
 eslint.config.js
 package-lock.json

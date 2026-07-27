@@ -117,7 +117,10 @@ test('branch plans exclude worktree edits while worktree plans include them', as
 
     write(repository, 'base.txt', 'unstaged worktree edit\n');
     write(repository, 'staged.txt', 'staged\n');
-    git(repository, 'add', 'staged.txt');
+    write(repository, '.vscode/local-reviews/registry.json', '{"version":2}\n');
+    git(repository, 'add', 'staged.txt', '.vscode/local-reviews/registry.json');
+    write(repository, '.vscode/local-reviews/reviews/review/comments.json', '{}\n');
+    write(repository, '.vscode/offline-review/legacy.json', '{}\n');
     write(repository, 'untracked.txt', 'untracked\n');
 
     const branchFilesWithWorktreeEdits = await service.getChangedFiles(refreshedPlan);
@@ -374,6 +377,49 @@ test('concurrent review creation is deduplicated per discriminated identity', as
     manager.dispose();
 });
 
+test('clearing reviews cancels older pending creations without blocking a new request', async () => {
+    const workspace = temporaryDirectory('offline-review-clear-race-');
+    installVscodeMock(workspace);
+    let releaseCommits;
+    const commitsReady = new Promise(resolve => { releaseCommits = resolve; });
+    let waitForCommits = true;
+    const managerGitService = {
+        async getCommitHash(ref) {
+            if (waitForCommits) {
+                await commitsReady;
+            }
+            return ref === 'main' ? 'a'.repeat(40) : 'b'.repeat(40);
+        },
+    };
+    const { LocalPrManager } = built('services/localPrManager');
+    const manager = new LocalPrManager(managerGitService, workspace);
+    const staleCreation = manager.createBranchReview('main', 'feature', false);
+    manager.clearAllReviews();
+    waitForCommits = false;
+    releaseCommits();
+    await assert.rejects(staleCreation, /superseded by a clear operation/);
+    assert.deepEqual(manager.listReviews(), []);
+
+    const freshReview = await manager.createBranchReview('main', 'feature', false);
+    assert.equal(manager.listReviews().length, 1);
+    assert.equal(manager.getReviewById(freshReview.id).targetBranch, 'feature');
+    manager.setActiveReview(freshReview.id);
+    manager.setPreferredBaseBranch('main');
+    manager.clearAllReviews();
+    assert.deepEqual(manager.listReviews(), []);
+    assert.equal(manager.getActiveReview(), undefined);
+    assert.equal(manager.getActiveMode(), 'branch');
+    assert.equal(manager.getPreferredBaseBranch(), 'main');
+    manager.dispose();
+
+    const restored = new LocalPrManager(managerGitService, workspace);
+    assert.deepEqual(restored.listReviews(), []);
+    assert.equal(restored.getActiveReview(), undefined);
+    assert.equal(restored.getActiveMode(), 'branch');
+    assert.equal(restored.getPreferredBaseBranch(), 'main');
+    restored.dispose();
+});
+
 test('checkout events include same-commit detach and reattach transitions', () => {
     installVscodeMock('/tmp/offline-review-checkout-test');
     const changes = new vscode.EventEmitter();
@@ -560,6 +606,7 @@ test('worktree URIs carry prepared identity and file refresh invalidates every m
         parseDiffDocumentUri,
     } = built('git/gitService');
     const { GitFileContentProvider } = built('git/gitFileContentProvider');
+    const { getLiveWorktreeUri } = built('language/virtualDocLanguageFeatures');
     const reviewA = '77777777-7777-4777-8777-777777777777';
     const reviewB = '88888888-8888-4888-8888-888888888888';
     const headA = 'a'.repeat(40);
@@ -619,7 +666,13 @@ test('worktree URIs carry prepared identity and file refresh invalidates every m
         { kind: 'git', ref: headA },
         'src/file.txt',
         'modified',
-        reviewA
+        reviewA,
+        worktreeRoot
+    );
+    assert.equal(getLiveWorktreeUri(immutable), undefined);
+    assert.equal(
+        getLiveWorktreeUri(uriA).fsPath,
+        path.join(worktreeRoot, 'src/file.txt')
     );
     vscode.workspace.textDocuments = [uriA, uriB, uriNewHead, uriNewPlan, otherFile, immutable]
         .map(uri => ({ uri }));
@@ -726,6 +779,162 @@ test('same-HEAD worktree comments remain attached after a document-cache refresh
     assert.equal(await provider.refresh(secondPlan), true);
     provider.getChildren();
     assert.equal(provider.getAllFileItems()[0].commentCount, 1);
+
+    provider.dispose();
+    controller.dispose();
+    manager.dispose();
+});
+
+test('deleted files accept comments on the immutable original side', async () => {
+    const workspace = temporaryDirectory('offline-review-deleted-comments-');
+    installVscodeMock(workspace);
+    const baseCommit = 'a'.repeat(40);
+    const targetCommit = 'b'.repeat(40);
+    const { LocalPrManager } = built('services/localPrManager');
+    const { StorageService } = built('storage/storageService');
+    const { ReviewCommentController } = built('comments/commentController');
+    const { getDiffDocumentUri, getFileDiffUris } = built('git/gitService');
+    const { ChangedFilesProvider } = built('views/changedFilesProvider');
+    const manager = new LocalPrManager({
+        async getCommitHash(ref) {
+            return ref === 'main' ? baseCommit : targetCommit;
+        },
+    }, workspace);
+    const review = await manager.createBranchReview('main', 'feature', false);
+    manager.setActiveReview(review.id);
+    const storage = new StorageService(manager);
+    const controller = new ReviewCommentController(storage);
+    const plan = {
+        kind: 'branch',
+        reviewId: review.id,
+        worktreeRoot: workspace,
+        baseBranch: 'main',
+        targetBranch: 'feature',
+        baseCommit,
+        mergeBaseCommit: baseCommit,
+        targetCommit,
+        left: { kind: 'git', ref: baseCommit },
+        right: { kind: 'git', ref: targetCommit },
+    };
+    controller.setReviewableFiles(['deleted.txt'], ['deleted.txt']);
+    controller.loadAllThreads(plan);
+    const leftUri = getDiffDocumentUri(
+        plan.left,
+        'deleted.txt',
+        'original',
+        review.id,
+        workspace
+    );
+    const rightUri = getDiffDocumentUri(
+        plan.right,
+        'deleted.txt',
+        'modified',
+        review.id,
+        workspace
+    );
+    const documentFor = uri => ({
+        uri,
+        lineCount: 2,
+        lineAt() { return { range: { end: { character: 4 } } }; },
+    });
+    assert.equal(
+        controller.controller.commentingRangeProvider
+            .provideCommentingRanges(documentFor(leftUri)).length,
+        1
+    );
+    assert.equal(
+        controller.controller.commentingRangeProvider
+            .provideCommentingRanges(documentFor(rightUri)).length,
+        0
+    );
+    assert.equal(controller.captureNewThreadReviewId(leftUri, 'deleted.txt'), review.id);
+    assert.throws(
+        () => controller.captureNewThreadReviewId(rightUri, 'deleted.txt'),
+        /prepared diff target/
+    );
+    controller.createThread(
+        leftUri,
+        new vscode.Range(1, 0, 1, 0),
+        'comment on deleted line',
+        'deleted.txt'
+    );
+    const comments = storage.loadCommentsForReview(review.id);
+    assert.deepEqual(comments.threads[0].target, {
+        kind: 'git',
+        ref: baseCommit,
+        side: 'original',
+        filePath: 'deleted.txt',
+    });
+    storage.addThread(
+        review.id,
+        { kind: 'git', ref: targetCommit, filePath: 'deleted.txt' },
+        'deleted.txt',
+        0,
+        0,
+        'wrong side',
+        'test'
+    );
+
+    const provider = new ChangedFilesProvider({
+        async getChangedFiles() {
+            return [{ status: 'deleted', filePath: 'deleted.txt' }];
+        },
+        async getCommitsForDiff() { return []; },
+        getFileDiffUris,
+    }, storage, manager);
+    assert.equal(await provider.refresh(plan), true);
+    provider.getChildren();
+    const deletedItem = provider.getAllFileItems()[0];
+    assert.equal(deletedItem.commentCount, 1);
+    assert.equal(deletedItem.commentUri.toString(), deletedItem.leftUri.toString());
+    assert.equal(
+        new URLSearchParams(vscode.__createdCommentThreads.at(-1).uri.query).get('side'),
+        'original'
+    );
+
+    const worktreeReview = await manager.createUncommittedReview('feature', false);
+    manager.setActiveReview(worktreeReview.id);
+    const worktreePlanId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+    const worktreePlan = {
+        kind: 'worktree',
+        reviewId: worktreeReview.id,
+        worktreeRoot: workspace,
+        branch: 'feature',
+        headCommit: targetCommit,
+        planId: worktreePlanId,
+        left: { kind: 'git', ref: targetCommit },
+        right: {
+            kind: 'worktree',
+            reviewId: worktreeReview.id,
+            headCommit: targetCommit,
+            planId: worktreePlanId,
+            worktreeRoot: workspace,
+        },
+    };
+    controller.setReviewableFiles(['removed-worktree.txt'], ['removed-worktree.txt']);
+    controller.loadAllThreads(worktreePlan);
+    const worktreeLeftUri = getDiffDocumentUri(
+        worktreePlan.left,
+        'removed-worktree.txt',
+        'original',
+        worktreeReview.id,
+        workspace
+    );
+    controller.createThread(
+        worktreeLeftUri,
+        new vscode.Range(0, 0, 0, 0),
+        'deleted before commit',
+        'removed-worktree.txt'
+    );
+    assert.deepEqual(
+        storage.loadCommentsForReview(worktreeReview.id).threads[0].target,
+        {
+            kind: 'git',
+            ref: targetCommit,
+            side: 'original',
+            filePath: 'removed-worktree.txt',
+        }
+    );
 
     provider.dispose();
     controller.dispose();

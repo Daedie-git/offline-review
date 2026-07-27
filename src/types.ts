@@ -150,9 +150,11 @@ export interface PreparedDiffState {
 
 export interface GitThreadTarget {
     readonly kind: 'git';
-    /** Immutable target commit on which the thread was authored. */
+    /** Immutable commit on which the thread was authored. */
     readonly ref: string;
-    /** Path as it existed in the immutable target snapshot. */
+    /** Existing v2 targets omit this and are interpreted as modified/right. */
+    readonly side?: 'original' | 'modified';
+    /** Path as it existed in the immutable snapshot. */
     readonly filePath: string;
 }
 
@@ -197,17 +199,26 @@ export interface CommentsFile {
 export function isThreadCurrentForPlan(
     thread: ReviewThread,
     plan: DiffPlan,
-    filePath: string = thread.filePath
+    filePath: string = thread.filePath,
+    expectedSide: 'original' | 'modified' = 'modified'
 ): boolean {
     const target = thread.target;
     if (target.filePath !== filePath) {
         return false;
     }
-    return plan.kind === 'branch'
-        ? target.kind === 'git' && target.ref === plan.targetCommit
-        : target.kind === 'worktree'
-            && target.reviewId === plan.reviewId
-            && target.headCommit === plan.headCommit;
+    if ((target.kind === 'git' ? target.side ?? 'modified' : 'modified') !== expectedSide) {
+        return false;
+    }
+    if (target.kind === 'git') {
+        const expectedRef = expectedSide === 'original'
+            ? plan.kind === 'branch' ? plan.mergeBaseCommit : plan.headCommit
+            : plan.kind === 'branch' ? plan.targetCommit : undefined;
+        return expectedRef !== undefined && target.ref === expectedRef;
+    }
+    return expectedSide === 'modified'
+        && plan.kind === 'worktree'
+        && target.reviewId === plan.reviewId
+        && target.headCommit === plan.headCommit;
 }
 
 export interface LocalPrRegistry {

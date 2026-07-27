@@ -21,6 +21,10 @@ import {
 const MAX_GIT_OUTPUT = 10 * 1024 * 1024;
 const DEFAULT_GIT_TIMEOUT = 30_000;
 const GIT_URI_SCHEME = 'git-local-review';
+const REVIEW_STORAGE_PATHS = [
+    '.vscode/local-reviews',
+    '.vscode/offline-review',
+] as const;
 
 export interface FileDiffUris {
     readonly left: vscode.Uri;
@@ -668,7 +672,12 @@ export class GitService {
                 '--',
             ], DEFAULT_GIT_TIMEOUT, plan.worktreeRoot);
 
-        const files = parseNameStatus(output);
+        // Review metadata is implementation state, never user-authored review
+        // content—even when the host repository does not ignore these paths.
+        const files = parseNameStatus(output).filter(change =>
+            !isReviewStoragePath(change.filePath)
+            && (!change.oldFilePath || !isReviewStoragePath(change.oldFilePath))
+        );
         if (plan.kind === 'worktree') {
             const untrackedOutput = await this.execGit([
                 'ls-files',
@@ -679,7 +688,7 @@ export class GitService {
             ], DEFAULT_GIT_TIMEOUT, plan.worktreeRoot);
             const seen = new Set(files.map(file => file.filePath));
             for (const filePath of splitNul(untrackedOutput)) {
-                if (!seen.has(filePath)) {
+                if (!isReviewStoragePath(filePath) && !seen.has(filePath)) {
                     files.push({ status: 'added', filePath });
                     seen.add(filePath);
                 }
@@ -1049,6 +1058,13 @@ function isSafeRelativeGitPath(filePath: string): boolean {
         return false;
     }
     return !filePath.split(/[\\/]/).some(segment => segment === '..' || segment === '');
+}
+
+function isReviewStoragePath(filePath: string): boolean {
+    const normalized = filePath.replace(/\\/g, '/').replace(/^\.\//, '');
+    return REVIEW_STORAGE_PATHS.some(storagePath =>
+        normalized === storagePath || normalized.startsWith(`${storagePath}/`)
+    );
 }
 
 function isPathInside(root: string, candidate: string, allowEqual: boolean = false): boolean {

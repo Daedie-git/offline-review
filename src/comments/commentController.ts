@@ -37,6 +37,7 @@ export class ReviewCommentController {
     private readonly threads = new Map<string, ManagedCommentThread>();
     private readonly commentIdentities = new WeakMap<vscode.Comment, CommentIdentity>();
     private readonly reviewableFiles = new Set<string>();
+    private readonly originalSideFiles = new Set<string>();
     private activePlan: DiffPlan | undefined;
 
     constructor(private readonly storageService: StorageService) {
@@ -47,29 +48,18 @@ export class ReviewCommentController {
 
         this.controller.commentingRangeProvider = {
             provideCommentingRanges: (document: vscode.TextDocument): vscode.Range[] => {
-                if (document.uri.scheme === 'git-local-review') {
-                    const params = new URLSearchParams(document.uri.query);
-                    if (params.get('side') !== 'modified') {
-                        return [];
-                    }
-                    if (this.activePlan) {
-                        const filePath = uriFilePath(document.uri);
-                        const expected = getDiffDocumentUri(
-                            this.activePlan.right,
-                            filePath,
-                            'modified',
-                            this.activePlan.reviewId,
-                            this.activePlan.worktreeRoot
-                        );
-                        if (document.uri.toString() !== expected.toString()) {
-                            return [];
-                        }
-                    }
-                } else {
+                const plan = this.activePlan;
+                if (document.uri.scheme !== 'git-local-review' || !plan) {
                     // New threads are authored only on plan-identified virtual
                     // targets. A file:// URI cannot retain pending ownership
                     // across a review switch, so accepting it could write into
                     // the newly active review by accident.
+                    return [];
+                }
+
+                const filePath = uriFilePath(document.uri);
+                if (!this.reviewableFiles.has(filePath)
+                    || document.uri.toString() !== this.currentTargetUri(plan, filePath).toString()) {
                     return [];
                 }
 
@@ -84,26 +74,40 @@ export class ReviewCommentController {
         };
     }
 
-    setReviewableFiles(filePaths: readonly string[]): void {
+    setReviewableFiles(
+        filePaths: readonly string[],
+        originalSideFilePaths: readonly string[] = []
+    ): void {
         this.reviewableFiles.clear();
+        this.originalSideFiles.clear();
         for (const filePath of filePaths) {
             this.reviewableFiles.add(filePath);
         }
+        for (const filePath of originalSideFilePaths) {
+            if (this.reviewableFiles.has(filePath)) {
+                this.originalSideFiles.add(filePath);
+            }
+        }
     }
 
-    /** Load one file's threads only on the exact modified/right URI. */
+    private currentTargetUri(plan: DiffPlan, filePath: string): vscode.Uri {
+        const original = this.originalSideFiles.has(filePath);
+        return getDiffDocumentUri(
+            original ? plan.left : plan.right,
+            filePath,
+            original ? 'original' : 'modified',
+            plan.reviewId,
+            plan.worktreeRoot
+        );
+    }
+
+    /** Load one file's threads only on its exact reviewable diff side. */
     loadThreadsForFile(targetUri: vscode.Uri, filePath: string, plan: DiffPlan | undefined = this.activePlan): void {
         if (plan) {
-            if (this.activePlan && this.activePlan !== plan) {
+            if (this.activePlan !== plan) {
                 return;
             }
-            const expected = getDiffDocumentUri(
-                plan.right,
-                filePath,
-                'modified',
-                plan.reviewId,
-                plan.worktreeRoot
-            );
+            const expected = this.currentTargetUri(plan, filePath);
             if (targetUri.toString() !== expected.toString()) {
                 return;
             }
@@ -118,7 +122,13 @@ export class ReviewCommentController {
         }
         for (const thread of comments.threads) {
             if (!plan
-                || !isThreadCurrentForPlan(thread, plan, filePath)) {
+                || !isThreadCurrentForPlan(
+                    thread,
+                    plan,
+                    filePath,
+                    this.originalSideFiles.has(filePath) ? 'original' : 'modified'
+                )
+                || threadTargetUri(thread.target, plan).toString() !== targetUri.toString()) {
                 continue;
             }
             const key = targetUri.scheme === 'file'
@@ -173,7 +183,11 @@ export class ReviewCommentController {
         if (expectedReviewId && plan.reviewId !== expectedReviewId) {
             throw new Error('The active review changed before the comment was submitted');
         }
-        const target = targetFromPlan(plan, filePath);
+        const target = targetFromPlan(
+            plan,
+            filePath,
+            this.originalSideFiles.has(filePath) ? 'original' : 'modified'
+        );
         const savedThread = this.storageService.addThread(
             plan.reviewId,
             target,
@@ -202,14 +216,9 @@ export class ReviewCommentController {
             throw new Error('No prepared review is active');
         }
         if (uri.scheme === 'git-local-review') {
-            const expected = getDiffDocumentUri(
-                plan.right,
-                filePath,
-                'modified',
-                plan.reviewId,
-                plan.worktreeRoot
-            );
-            if (uri.toString() !== expected.toString()) {
+            const expected = this.currentTargetUri(plan, filePath);
+            if (!this.reviewableFiles.has(filePath)
+                || uri.toString() !== expected.toString()) {
                 throw new Error('Comments can only be added to the prepared diff target');
             }
         } else {
@@ -510,7 +519,19 @@ function commentBody(comment: vscode.Comment): string {
     return typeof comment.body === 'string' ? comment.body : comment.body.value;
 }
 
-function targetFromPlan(plan: DiffPlan, filePath: string): ReviewThreadTarget {
+function targetFromPlan(
+    plan: DiffPlan,
+    filePath: string,
+    side: 'original' | 'modified'
+): ReviewThreadTarget {
+    if (side === 'original') {
+        return {
+            kind: 'git',
+            ref: plan.kind === 'branch' ? plan.mergeBaseCommit : plan.headCommit,
+            side,
+            filePath,
+        };
+    }
     return plan.kind === 'branch'
         ? { kind: 'git', ref: plan.targetCommit, filePath }
         : {
@@ -543,7 +564,7 @@ function threadTargetUri(target: ReviewThreadTarget, plan: DiffPlan): vscode.Uri
     return getDiffDocumentUri(
         document,
         target.filePath,
-        'modified',
+        target.kind === 'git' ? target.side ?? 'modified' : 'modified',
         plan.reviewId,
         plan.worktreeRoot
     );

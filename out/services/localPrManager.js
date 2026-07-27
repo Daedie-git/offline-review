@@ -49,6 +49,8 @@ class LocalPrManager {
         this.gitService = gitService;
         this.registry = EMPTY_REGISTRY();
         this.pendingReviewCreations = new Map();
+        /** Destructive operations invalidate older in-flight review creations. */
+        this.creationEpoch = 0;
         this._onDidChange = new vscode.EventEmitter();
         this.onDidChange = this._onDidChange.event;
         this.storageDir = path.join(workspaceRoot, '.vscode', 'local-reviews');
@@ -140,7 +142,7 @@ class LocalPrManager {
         const identity = JSON.stringify([mode, sourceBranch, targetBranch]);
         let creation = this.pendingReviewCreations.get(identity);
         if (!creation) {
-            creation = this.resolveAndStoreReview(sourceBranch, targetBranch, mode);
+            creation = this.resolveAndStoreReview(sourceBranch, targetBranch, mode, this.creationEpoch);
             this.pendingReviewCreations.set(identity, creation);
         }
         let review;
@@ -157,7 +159,7 @@ class LocalPrManager {
         }
         return review;
     }
-    async resolveAndStoreReview(sourceBranch, targetBranch, mode) {
+    async resolveAndStoreReview(sourceBranch, targetBranch, mode, creationEpoch) {
         let review;
         if (mode === 'branch') {
             const [sourceCommit, targetCommit] = await Promise.all([
@@ -184,6 +186,9 @@ class LocalPrManager {
                 targetCommit: snapshotCommit,
                 createdAt: new Date().toISOString(),
             };
+        }
+        if (creationEpoch !== this.creationEpoch) {
+            throw new Error('Review creation was superseded by a clear operation');
         }
         const existing = this.findReviewByIdentity(sourceBranch, targetBranch, mode);
         if (existing) {
@@ -244,14 +249,22 @@ class LocalPrManager {
         this.saveRegistry();
         return true;
     }
+    invalidatePendingCreations() {
+        this.creationEpoch++;
+        this.pendingReviewCreations.clear();
+    }
     deleteReview(id) {
         const review = this.getReviewById(id);
         if (!review) {
             return;
         }
+        const deletingActive = this.registry.activeReviewId === id;
+        if (deletingActive) {
+            this.invalidatePendingCreations();
+        }
         fs.rmSync(this.getReviewDir(review), { recursive: true, force: true });
         this.registry.reviews = this.registry.reviews.filter(candidate => candidate.id !== id);
-        if (this.registry.activeReviewId === id) {
+        if (deletingActive) {
             this.registry.activeReviewId = undefined;
         }
         this.saveRegistry();
@@ -265,6 +278,7 @@ class LocalPrManager {
         return true;
     }
     clearAllReviews() {
+        this.invalidatePendingCreations();
         for (const review of this.registry.reviews) {
             fs.rmSync(this.getReviewDir(review), { recursive: true, force: true });
         }

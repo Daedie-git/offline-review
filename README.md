@@ -1,7 +1,5 @@
 # Offline Review
 
-[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/Daedie.offline-review?label=VS%20Code%20Marketplace&logo=visualstudiocode)](https://marketplace.visualstudio.com/items?itemName=Daedie.offline-review)
-[![Installs](https://img.shields.io/visual-studio-marketplace/i/Daedie.offline-review)](https://marketplace.visualstudio.com/items?itemName=Daedie.offline-review)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Daedie-git/offline-review/blob/HEAD/LICENSE)
 
 A VS Code extension for local branch diff review with offline inline comments. Review your own code changes before pushing — no GitHub/remote needed.
@@ -44,8 +42,9 @@ Install directly from the [VS Code Marketplace](https://marketplace.visualstudio
 - **Linked Worktree Review** - Select any linked Git worktree without changing the open VS Code workspace
 - **Two Review Modes** - Review the selected worktree's uncommitted changes or its active branch against a base
 - **Branch Diff View** - Select a base branch and see all changed files on the active branch
-- **Inline Comments** - Add, edit, delete comments on any line in the diff
+- **Inline Comments** - Comment on modified lines and on the original side of deleted files
 - **Resolve/Unresolve** - Toggle comment threads as resolved with a single click
+- **Clean Working Diff** - Extension-owned `.vscode/local-reviews/` data is excluded from review results
 - **Tree Grouping** - Files grouped by directory with file count
 - **Reviewed Checkbox** - Track which files you've reviewed
 - **Comment Count Badge** - See comment count per file at a glance

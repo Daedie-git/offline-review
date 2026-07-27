@@ -8,6 +8,8 @@ export declare class LocalPrManager {
     private readonly reviewsDir;
     private readonly registryPath;
     private readonly pendingReviewCreations;
+    /** Destructive operations invalidate older in-flight review creations. */
+    private creationEpoch;
     private readonly _onDidChange;
     readonly onDidChange: vscode.Event<void>;
     constructor(gitService: GitService, workspaceRoot: string);
@@ -28,6 +30,7 @@ export declare class LocalPrManager {
     isUncommittedReview(review?: LocalPr): review is UncommittedReview;
     getReviewSourceTarget(review: LocalPr): ReviewSourceTarget;
     updateBranchReviewFallbackCommits(reviewId: string, sourceCommit: string, targetCommit: string): boolean;
+    private invalidatePendingCreations;
     deleteReview(id: string): void;
     clearActiveReview(): boolean;
     clearAllReviews(): void;

@@ -311,13 +311,16 @@ function validateThreadTarget(review, target, filePath) {
     if (!filePath || target.filePath !== filePath) {
         throw new Error('Comment target path does not match its thread path');
     }
-    if (review.mode === 'branch') {
-        if (target.kind !== 'git' || !isFullObjectId(target.ref)) {
-            throw new Error('Branch comments require an immutable target commit');
+    if (target.kind === 'git') {
+        if (!isFullObjectId(target.ref)
+            || (target.side !== undefined
+                && target.side !== 'original' && target.side !== 'modified')
+            || (review.mode === 'uncommitted' && target.side !== 'original')) {
+            throw new Error('Git comments require an immutable target commit and valid review side');
         }
         return;
     }
-    if (target.kind !== 'worktree'
+    if (review.mode === 'branch'
         || target.reviewId !== review.id
         || !isFullObjectId(target.headCommit)
         || !isUuid(target.planId)) {
@@ -359,7 +362,10 @@ function isCurrentThreadTarget(value) {
         return false;
     }
     return value.kind === 'git'
-        ? typeof value.ref === 'string' && isFullObjectId(value.ref)
+        ? typeof value.ref === 'string'
+            && isFullObjectId(value.ref)
+            && (value.side === undefined
+                || value.side === 'original' || value.side === 'modified')
         : value.kind === 'worktree'
             && typeof value.reviewId === 'string'
             && isUuid(value.reviewId)
