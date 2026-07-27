@@ -290,7 +290,7 @@ test('production transition coordinator retries source and watcher dirtiness and
 
     storage.ensureCommentsFileForReview(review.id);
     const commentsPath = path.join(
-        workspace, '.vscode/local-reviews/reviews', review.id, 'comments.json'
+        workspace, '.vscode/offline-reviews/reviews', review.id, 'comments.json'
     );
     let watcherRelease;
     let watcherStarted;
@@ -382,7 +382,7 @@ test('review watcher bounds own hash and absence recognition across A/B/A and de
         review.id, target, 'file.ts', 0, 0, 'body A', 'tester', 'line'
     );
     const commentsPath = path.join(
-        workspace, '.vscode/local-reviews/reviews', review.id, 'comments.json'
+        workspace, '.vscode/offline-reviews/reviews', review.id, 'comments.json'
     );
     const bytesA = fs.readFileSync(commentsPath);
     let refreshes = 0;
@@ -457,7 +457,7 @@ test('malformed present review comments refuse every mutation without changing b
         review.id, target, 'file.ts', 0, 0, 'body', 'tester', 'line'
     );
     const commentsPath = path.join(
-        workspace, '.vscode/local-reviews/reviews', review.id, 'comments.json'
+        workspace, '.vscode/offline-reviews/reviews', review.id, 'comments.json'
     );
     const malformed = JSON.parse(fs.readFileSync(commentsPath, 'utf8'));
     malformed.threads[0].sourceAnchor = 42;
@@ -503,7 +503,7 @@ test('workspace absent reads stay non-mutating and delayed open uses the latest 
     const thread = storage.addThread(
         'src/file.ts', 0, 0, 'anchor', 'body', 'tester'
     );
-    assert.equal(fs.existsSync(path.join(workspace, '.vscode/local-reviews')), true);
+    assert.equal(fs.existsSync(path.join(workspace, '.vscode/offline-reviews')), true);
     const before = fs.readFileSync(storage.filePath);
     const { WorkspaceCommentController } = built('workspaceComments/controller');
     const { WorkspaceCommentsProvider } = built('workspaceComments/provider');

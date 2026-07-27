@@ -62,7 +62,7 @@ class WorkspaceCommentsTool {
         const result = {
             workspace: {
                 root: this.pathResolver.workspaceRoot,
-                storage: '.vscode/local-reviews/workspace-comments.json',
+                storage: '.vscode/offline-reviews/workspace-comments.json',
             },
             totalThreads: reports.length,
             unresolvedCount: reports.filter(thread => thread.state === 'unresolved').length,

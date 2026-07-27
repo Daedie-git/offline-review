@@ -102,7 +102,7 @@ test('review comments v2 accepts legacy and optional anchors, rejects non-string
         review.id, target, 'src/file.ts', 1, 1, 'anchored', 'tester', 'exact line'
     );
     const filePath = path.join(
-        workspace, '.vscode/local-reviews/reviews', review.id, 'comments.json'
+        workspace, '.vscode/offline-reviews/reviews', review.id, 'comments.json'
     );
     const bytes = fs.readFileSync(filePath);
     let loaded = storage.loadCommentsForReview(review.id);
@@ -183,7 +183,7 @@ test('branch projections reconstruct immutable Git anchors and resolve only same
     files.push({ status: 'deleted', filePath: 'original.ts' });
     files.push({ status: 'renamed', filePath: 'new-name.ts', oldFilePath: 'old-name.ts' });
     const commentsPath = path.join(
-        workspace, '.vscode/local-reviews/reviews', review.id, 'comments.json'
+        workspace, '.vscode/offline-reviews/reviews', review.id, 'comments.json'
     );
     const before = fs.readFileSync(commentsPath);
     const state = await resolver.prepare(plan, files);

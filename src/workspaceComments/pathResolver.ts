@@ -4,7 +4,7 @@ import * as vscode from 'vscode';
 import { canonicalPath, isContained, sameCanonicalPath } from './safeFilesystem';
 import { WorkspacePathStatus } from './types';
 
-const STORAGE_PARTS = ['.vscode', 'local-reviews'];
+const STORAGE_PARTS = ['.vscode', 'offline-reviews'];
 
 export interface ResolvedWorkspacePath {
     readonly filePath: string;

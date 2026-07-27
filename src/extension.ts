@@ -729,7 +729,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         );
     };
     const watcherPatterns = [
-        '.vscode/local-reviews/reviews/*/comments.json',
+        '.vscode/offline-reviews/reviews/*/comments.json',
     ];
     for (const pattern of watcherPatterns) {
         const watcher = vscode.workspace.createFileSystemWatcher(
@@ -764,7 +764,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const workspaceCommentsWatcher = vscode.workspace.createFileSystemWatcher(
         new vscode.RelativePattern(
             workspaceRoot,
-            '.vscode/local-reviews/workspace-comments.json'
+            '.vscode/offline-reviews/workspace-comments.json'
         )
     );
     context.subscriptions.push(

@@ -69,6 +69,50 @@ function repositoryState(branch, branches) {
     };
 }
 
+test('review storage targets only offline-reviews without legacy migration', async () => {
+    const workspace = temporaryDirectory('offline-review-storage-name-');
+    installVscodeMock(workspace);
+    const legacyRegistry = `${JSON.stringify({
+        version: 2,
+        reviews: [{
+            id: '11111111-1111-4111-8111-111111111111',
+            mode: 'branch',
+            baseBranch: 'legacy-base',
+            targetBranch: 'legacy-target',
+            sourceCommit: 'a'.repeat(40),
+            targetCommit: 'b'.repeat(40),
+            createdAt: new Date(0).toISOString(),
+        }],
+        activeMode: 'branch',
+    }, null, 2)}\n`;
+    const legacyPaths = [
+        '.vscode/local-reviews/registry.json',
+        '.vscode/offline-review/registry.json',
+    ];
+    for (const legacyPath of legacyPaths) {
+        write(workspace, legacyPath, legacyRegistry);
+    }
+
+    const { LocalPrManager } = built('services/localPrManager');
+    const manager = new LocalPrManager({
+        async getCommitHash(ref) {
+            return ref === 'main' ? 'c'.repeat(40) : 'd'.repeat(40);
+        },
+    }, workspace);
+    assert.deepEqual(manager.listReviews(), []);
+    const review = await manager.createBranchReview('main', 'feature');
+
+    const canonicalRegistry = path.join(
+        workspace, '.vscode', 'offline-reviews', 'registry.json'
+    );
+    assert.equal(fs.existsSync(canonicalRegistry), true);
+    assert.equal(JSON.parse(fs.readFileSync(canonicalRegistry, 'utf8')).reviews[0].id, review.id);
+    for (const legacyPath of legacyPaths) {
+        assert.equal(fs.readFileSync(path.join(workspace, legacyPath), 'utf8'), legacyRegistry);
+    }
+    manager.dispose();
+});
+
 test('branch plans exclude worktree edits while worktree plans include them', async () => {
     const repository = temporaryDirectory('offline-review-git-');
     installVscodeMock(repository);
@@ -117,10 +161,9 @@ test('branch plans exclude worktree edits while worktree plans include them', as
 
     write(repository, 'base.txt', 'unstaged worktree edit\n');
     write(repository, 'staged.txt', 'staged\n');
-    write(repository, '.vscode/local-reviews/registry.json', '{"version":2}\n');
-    git(repository, 'add', 'staged.txt', '.vscode/local-reviews/registry.json');
-    write(repository, '.vscode/local-reviews/reviews/review/comments.json', '{}\n');
-    write(repository, '.vscode/offline-review/legacy.json', '{}\n');
+    write(repository, '.vscode/offline-reviews/registry.json', '{"version":2}\n');
+    git(repository, 'add', 'staged.txt', '.vscode/offline-reviews/registry.json');
+    write(repository, '.vscode/offline-reviews/reviews/review/comments.json', '{}\n');
     write(repository, 'untracked.txt', 'untracked\n');
 
     const branchFilesWithWorktreeEdits = await service.getChangedFiles(refreshedPlan);
@@ -370,7 +413,7 @@ test('concurrent review creation is deduplicated per discriminated identity', as
     assert.equal(reviews.filter(review => review.mode === 'branch').length, 1);
     assert.equal(reviews.filter(review => review.mode === 'uncommitted').length, 1);
     const registry = JSON.parse(fs.readFileSync(
-        path.join(workspace, '.vscode', 'local-reviews', 'registry.json'),
+        path.join(workspace, '.vscode', 'offline-reviews', 'registry.json'),
         'utf8'
     ));
     assert.equal(registry.reviews.length, 2);

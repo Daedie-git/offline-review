@@ -64,7 +64,7 @@ export class WorkspaceCommentStorage {
         private readonly now: () => number = () => Date.now(),
         private readonly ownWriteWindowMs: number = DEFAULT_OWN_WRITE_WINDOW_MS
     ) {
-        const directory = path.join(pathResolver.canonicalRoot, '.vscode', 'local-reviews');
+        const directory = path.join(pathResolver.canonicalRoot, '.vscode', 'offline-reviews');
         this.filePath = path.join(directory, 'workspace-comments.json');
         this.lockPath = path.join(directory, '.workspace-comments.lock');
     }
@@ -561,7 +561,7 @@ export class WorkspaceCommentStorage {
 
     private hasSafelyAbsentStorageDirectory(): boolean {
         let current = this.pathResolver.canonicalRoot;
-        for (const component of ['.vscode', 'local-reviews']) {
+        for (const component of ['.vscode', 'offline-reviews']) {
             const next = path.join(current, component);
             if (!pathEntryExists(next)) {
                 return true;
@@ -580,7 +580,7 @@ export class WorkspaceCommentStorage {
 
     private ensureSafeStorageDirectory(): StorageDirectory {
         let current = this.pathResolver.canonicalRoot;
-        for (const component of ['.vscode', 'local-reviews']) {
+        for (const component of ['.vscode', 'offline-reviews']) {
             const parent = this.openVerifiedDirectory(current);
             const next = path.join(current, component);
             const boundNext = this.entryPath(parent, component);

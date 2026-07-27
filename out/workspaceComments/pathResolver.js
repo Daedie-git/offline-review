@@ -38,7 +38,7 @@ const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const vscode = __importStar(require("vscode"));
 const safeFilesystem_1 = require("./safeFilesystem");
-const STORAGE_PARTS = ['.vscode', 'local-reviews'];
+const STORAGE_PARTS = ['.vscode', 'offline-reviews'];
 class WorkspacePathResolver {
     constructor(workspaceRoot) {
         this.workspaceRoot = path.resolve(workspaceRoot);

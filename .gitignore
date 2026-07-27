@@ -1,4 +1,6 @@
 node_modules/
+.vscode/offline-reviews/
+# Abandoned storage names remain ignored but are never read or written.
 .vscode/local-reviews/
 .vscode/offline-review/
 *.vsix

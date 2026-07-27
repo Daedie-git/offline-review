@@ -2,7 +2,7 @@
   "name": "offline-review",
   "displayName": "Offline Review",
   "description": "Review diffs and annotate workspace code locally with offline inline comments — no remote needed.",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "publisher": "Daedie",
   "author": "Daedie",
   "icon": "resources/icon.png",

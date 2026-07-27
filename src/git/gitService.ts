@@ -22,8 +22,7 @@ const MAX_GIT_OUTPUT = 10 * 1024 * 1024;
 const DEFAULT_GIT_TIMEOUT = 30_000;
 const GIT_URI_SCHEME = 'git-local-review';
 const REVIEW_STORAGE_PATHS = [
-    '.vscode/local-reviews',
-    '.vscode/offline-review',
+    '.vscode/offline-reviews',
 ] as const;
 
 export interface FileDiffUris {

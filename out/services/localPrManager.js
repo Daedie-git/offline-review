@@ -53,7 +53,7 @@ class LocalPrManager {
         this.creationEpoch = 0;
         this._onDidChange = new vscode.EventEmitter();
         this.onDidChange = this._onDidChange.event;
-        this.storageDir = path.join(workspaceRoot, '.vscode', 'local-reviews');
+        this.storageDir = path.join(workspaceRoot, '.vscode', 'offline-reviews');
         this.reviewsDir = path.join(this.storageDir, 'reviews');
         this.registryPath = path.join(this.storageDir, 'registry.json');
         this.loadRegistry();

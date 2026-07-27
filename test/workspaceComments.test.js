@@ -122,7 +122,7 @@ test('workspace path authorization rejects lexical and canonical aliases and Git
     const outside = write(outsideRoot, 'outside.ts', 'outside\n');
     const storageFile = write(
         workspace,
-        '.vscode/local-reviews/workspace-comments.json',
+        '.vscode/offline-reviews/workspace-comments.json',
         '{"version":1,"threads":[]}'
     );
     const escapedLink = path.join(workspace, 'src', 'escaped.ts');
@@ -141,8 +141,8 @@ test('workspace path authorization rejects lexical and canonical aliases and Git
     assert.equal(resolver.resolveUri(vscode.Uri.file(storageFile)), undefined);
     assert.equal(resolver.normalizeStoredPath('../outside.ts'), undefined);
     assert.equal(resolver.normalizeStoredPath('src/../outside.ts'), undefined);
-    assert.equal(resolver.normalizeStoredPath('.vscode/local-reviews/other.json'), undefined);
-    assert.equal(resolver.normalizeStoredPath('.VSCODE/LOCAL-REVIEWS/other.json'), undefined);
+    assert.equal(resolver.normalizeStoredPath('.vscode/offline-reviews/other.json'), undefined);
+    assert.equal(resolver.normalizeStoredPath('.VSCODE/OFFLINE-REVIEWS/other.json'), undefined);
     assert.equal(resolver.normalizeStoredPath('.git/config'), undefined);
 
     fs.unlinkSync(inside);
@@ -153,7 +153,7 @@ test('workspace path authorization rejects lexical and canonical aliases and Git
 
 test('storage rejects symlinked directories and workspace-comments file', () => {
     const outside = temporaryDirectory('offline-code-comments-storage-outside-');
-    for (const component of ['.vscode', 'local-reviews', 'workspace-comments.json']) {
+    for (const component of ['.vscode', 'offline-reviews', 'workspace-comments.json']) {
         const workspace = temporaryDirectory(`offline-code-comments-${component}-`);
         installVscodeMock(workspace);
         const { WorkspacePathResolver } = built('workspaceComments/pathResolver');
@@ -163,13 +163,13 @@ test('storage rejects symlinked directories and workspace-comments file', () => 
             fs.symlinkSync(outside, path.join(workspace, '.vscode'), 'dir');
         } else {
             fs.mkdirSync(path.join(workspace, '.vscode'));
-            if (component === 'local-reviews') {
-                fs.symlinkSync(outside, path.join(workspace, '.vscode/local-reviews'), 'dir');
+            if (component === 'offline-reviews') {
+                fs.symlinkSync(outside, path.join(workspace, '.vscode/offline-reviews'), 'dir');
             } else {
-                fs.mkdirSync(path.join(workspace, '.vscode/local-reviews'));
+                fs.mkdirSync(path.join(workspace, '.vscode/offline-reviews'));
                 const target = write(outside, 'comments.json', '{"version":1,"threads":[]}');
                 fs.symlinkSync(target, path.join(
-                    workspace, '.vscode/local-reviews/workspace-comments.json'
+                    workspace, '.vscode/offline-reviews/workspace-comments.json'
                 ));
             }
         }
@@ -191,7 +191,7 @@ test('fresh storage children are descriptor-bound and parent-synced before desce
     fs.mkdirSync = (directory, ...args) => {
         const result = originalMkdir(directory, ...args);
         const name = path.basename(String(directory));
-        if (name === '.vscode' || name === 'local-reviews') {
+        if (name === '.vscode' || name === 'offline-reviews') {
             events.push(`mkdir:${name}`);
             assert.match(String(directory), /^\/proc\/self\/fd\/\d+\//);
         }
@@ -210,14 +210,14 @@ test('fresh storage children are descriptor-bound and parent-synced before desce
         fs.fsyncSync = originalFsync;
     }
     const vscodeCreation = events.indexOf('mkdir:.vscode');
-    const localReviewsCreation = events.indexOf('mkdir:local-reviews');
-    assert.ok(vscodeCreation >= 0 && localReviewsCreation > vscodeCreation, events.join(','));
+    const offlineReviewsCreation = events.indexOf('mkdir:offline-reviews');
+    assert.ok(vscodeCreation >= 0 && offlineReviewsCreation > vscodeCreation, events.join(','));
     assert.ok(
-        events.slice(vscodeCreation + 1, localReviewsCreation).includes(`sync:${workspace}`),
+        events.slice(vscodeCreation + 1, offlineReviewsCreation).includes(`sync:${workspace}`),
         events.join(',')
     );
     assert.ok(
-        events.slice(localReviewsCreation + 1).includes(`sync:${path.join(workspace, '.vscode')}`),
+        events.slice(offlineReviewsCreation + 1).includes(`sync:${path.join(workspace, '.vscode')}`),
         events.join(',')
     );
 });
@@ -252,7 +252,7 @@ test('parent fsync preflight failure prevents fresh child publication', () => {
 
 test('existing storage directories do not require parent fsync during read-only load', () => {
     const workspace = temporaryDirectory('offline-code-comments-existing-storage-');
-    fs.mkdirSync(path.join(workspace, '.vscode/local-reviews'), { recursive: true });
+    fs.mkdirSync(path.join(workspace, '.vscode/offline-reviews'), { recursive: true });
     installVscodeMock(workspace);
     const { WorkspacePathResolver } = built('workspaceComments/pathResolver');
     const { WorkspaceCommentStorage } = built('workspaceComments/storage');
@@ -1137,9 +1137,9 @@ test('code-comments tool filters safely without review-bucket changes', async ()
     const thread = storage.addThread(
         'src/tool.ts', 0, 0, 'const value = 1;', 'rename value', 'tester'
     );
-    write(workspace, '.vscode/local-reviews/reviews/review-id/comments.json', '{"version":2}\n');
+    write(workspace, '.vscode/offline-reviews/reviews/review-id/comments.json', '{"version":2}\n');
     const reviewBucket = path.join(
-        workspace, '.vscode/local-reviews/reviews/review-id/comments.json'
+        workspace, '.vscode/offline-reviews/reviews/review-id/comments.json'
     );
     const reviewBefore = fs.readFileSync(reviewBucket, 'utf8');
 

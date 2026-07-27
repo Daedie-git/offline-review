@@ -568,7 +568,7 @@ async function activate(context) {
         commentsWatcherCoordinator.notify(path.basename(path.dirname(uri.fsPath)), uri.fsPath);
     };
     const watcherPatterns = [
-        '.vscode/local-reviews/reviews/*/comments.json',
+        '.vscode/offline-reviews/reviews/*/comments.json',
     ];
     for (const pattern of watcherPatterns) {
         const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(workspaceRoot, pattern));
@@ -587,7 +587,7 @@ async function activate(context) {
     const onWorkspaceCommentsChanged = (uri) => {
         workspaceCommentsWatcherCoordinator.notify(uri.fsPath);
     };
-    const workspaceCommentsWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(workspaceRoot, '.vscode/local-reviews/workspace-comments.json'));
+    const workspaceCommentsWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(workspaceRoot, '.vscode/offline-reviews/workspace-comments.json'));
     context.subscriptions.push(workspaceCommentsWatcher, workspaceCommentsWatcher.onDidChange(onWorkspaceCommentsChanged), workspaceCommentsWatcher.onDidCreate(onWorkspaceCommentsChanged), workspaceCommentsWatcher.onDidDelete(onWorkspaceCommentsChanged), workspaceCommentsWatcherCoordinator);
     context.subscriptions.push(vscode.commands.registerCommand('localPrReview.createReview', async () => {
         if (branchSelectorProvider.getMode() === 'uncommitted') {
