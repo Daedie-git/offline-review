@@ -41,10 +41,10 @@ const crypto = __importStar(require("crypto"));
 class LocalPrManager {
     constructor(gitService, workspaceRoot) {
         this.gitService = gitService;
-        this.registry = { version: 1, reviews: [] };
+        this.registry = { version: 1, reviews: [], activeMode: 'branch' };
         this._onDidChange = new vscode.EventEmitter();
         this.onDidChange = this._onDidChange.event;
-        this.reviewsDir = path.join(workspaceRoot, '.vscode', 'local-reviews');
+        this.reviewsDir = path.join(workspaceRoot, '.vscode', 'offline-review');
         this.registryPath = path.join(this.reviewsDir, 'registry.json');
         this.loadRegistry();
     }
@@ -53,10 +53,13 @@ class LocalPrManager {
             if (fs.existsSync(this.registryPath)) {
                 const data = fs.readFileSync(this.registryPath, 'utf-8');
                 this.registry = JSON.parse(data);
+                if (!this.registry.activeMode) {
+                    this.registry.activeMode = 'branch';
+                }
             }
         }
         catch {
-            this.registry = { version: 1, reviews: [] };
+            this.registry = { version: 1, reviews: [], activeMode: 'branch' };
         }
     }
     saveRegistry() {
@@ -66,11 +69,17 @@ class LocalPrManager {
         fs.writeFileSync(this.registryPath, JSON.stringify(this.registry, null, 2), 'utf-8');
         this._onDidChange.fire();
     }
-    async createReview(sourceBranch, targetBranch) {
+    async createReview(sourceBranch, targetBranch, mode) {
         // Check if review already exists for this branch pair
         const existing = this.registry.reviews.find(r => r.sourceBranch === sourceBranch && r.targetBranch === targetBranch);
         if (existing) {
             this.setActiveReview(existing.id);
+            if (mode) {
+                this.setActiveMode(mode);
+            }
+            else {
+                this.setActiveMode(sourceBranch === targetBranch ? 'uncommitted' : 'branch');
+            }
             return existing;
         }
         const sourceCommit = await this.gitService.getCommitHash(sourceBranch);
@@ -85,8 +94,35 @@ class LocalPrManager {
         };
         this.registry.reviews.push(review);
         this.registry.activeReviewId = review.id;
+        this.registry.activeMode = mode || (sourceBranch === targetBranch ? 'uncommitted' : 'branch');
+        if (sourceBranch !== targetBranch) {
+            this.registry.preferredBaseBranch = sourceBranch;
+        }
         this.saveRegistry();
         return review;
+    }
+    getPreferredBaseBranch() {
+        return this.registry.preferredBaseBranch;
+    }
+    setPreferredBaseBranch(branch) {
+        if (!branch || this.registry.preferredBaseBranch === branch) {
+            return;
+        }
+        this.registry.preferredBaseBranch = branch;
+        this.saveRegistry();
+    }
+    getActiveMode() {
+        return this.registry.activeMode || 'branch';
+    }
+    setActiveMode(mode) {
+        if (this.registry.activeMode === mode) {
+            return;
+        }
+        this.registry.activeMode = mode;
+        this.saveRegistry();
+    }
+    isUncommittedReview(review = this.getActiveReview()) {
+        return !!review && review.sourceBranch === review.targetBranch;
     }
     deleteReview(id) {
         const review = this.registry.reviews.find(r => r.id === id);
@@ -103,6 +139,38 @@ class LocalPrManager {
             this.registry.activeReviewId = undefined;
         }
         this.saveRegistry();
+    }
+    clearActiveReview() {
+        const active = this.getActiveReview();
+        if (!active) {
+            return false;
+        }
+        this.deleteReview(active.id);
+        return true;
+    }
+    clearAllReviews() {
+        for (const review of [...this.registry.reviews]) {
+            const commentsDir = this.getReviewDir(review);
+            if (fs.existsSync(commentsDir)) {
+                fs.rmSync(commentsDir, { recursive: true, force: true });
+            }
+        }
+        this.registry.reviews = [];
+        this.registry.activeReviewId = undefined;
+        this.saveRegistry();
+        if (fs.existsSync(this.reviewsDir)) {
+            for (const entry of fs.readdirSync(this.reviewsDir)) {
+                if (entry === 'registry.json') {
+                    continue;
+                }
+                try {
+                    fs.rmSync(path.join(this.reviewsDir, entry), { recursive: true, force: true });
+                }
+                catch {
+                    // ignore
+                }
+            }
+        }
     }
     setActiveReview(id) {
         this.registry.activeReviewId = id;

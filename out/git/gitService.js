@@ -36,6 +36,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.GitService = void 0;
 const vscode = __importStar(require("vscode"));
 const cp = __importStar(require("child_process"));
+const fs = __importStar(require("fs"));
+const path = __importStar(require("path"));
 class GitService {
     constructor(context) {
         this.context = context;
@@ -124,6 +126,68 @@ class GitService {
     async getCurrentBranch() {
         return this.repo?.state.HEAD?.name;
     }
+    /**
+     * Detect the repository's primary branch from Git metadata rather than
+     * guessing branch names. A valid saved preference is handled by callers.
+     */
+    async getPrimaryBranch(branches, excludeBranch) {
+        const available = branches || await this.getBranches(true);
+        const remotes = this.repo?.state.remotes
+            ?.map(remote => remote.name)
+            .filter((name) => !!name) ?? [];
+        const isEligible = (branch) => {
+            if (!branch || !available.includes(branch)) {
+                return false;
+            }
+            if (!excludeBranch) {
+                return true;
+            }
+            const mirrorsExcludedBranch = remotes.some(remote => branch === `${remote}/${excludeBranch}`);
+            return branch !== excludeBranch && !mirrorsExcludedBranch;
+        };
+        const selectRemoteHead = (remote, remoteHead) => {
+            const localHead = remoteHead.startsWith(`${remote}/`)
+                ? remoteHead.slice(remote.length + 1)
+                : remoteHead;
+            if (isEligible(localHead)) {
+                return localHead;
+            }
+            return isEligible(remoteHead) ? remoteHead : undefined;
+        };
+        // `origin` is conventionally the repository's primary remote. If it is
+        // absent, use the first configured remote instead of guessing a branch.
+        const primaryRemote = remotes.includes('origin') ? 'origin' : remotes[0];
+        if (primaryRemote) {
+            try {
+                const cachedHead = (await this.execGit(`symbolic-ref --quiet --short refs/remotes/${primaryRemote}/HEAD`)).trim();
+                const selected = selectRemoteHead(primaryRemote, cachedHead);
+                if (selected) {
+                    return selected;
+                }
+            }
+            catch {
+                // The cached symbolic ref is optional; query the remote below.
+            }
+            try {
+                const output = await this.execGitFile(['ls-remote', '--symref', primaryRemote, 'HEAD'], 3000);
+                const match = /^ref:\s+refs\/heads\/(.+)\s+HEAD$/m.exec(output);
+                if (match) {
+                    const selected = selectRemoteHead(primaryRemote, `${primaryRemote}/${match[1]}`);
+                    if (selected) {
+                        return selected;
+                    }
+                }
+            }
+            catch {
+                // Stay usable offline. An explicit selection may still exist.
+            }
+        }
+        // Without remote default-branch metadata, selecting the sole other
+        // local branch is unambiguous. Multiple choices require user input.
+        const localBranches = await this.getBranches(false);
+        const alternatives = localBranches.filter(isEligible);
+        return alternatives.length === 1 ? alternatives[0] : undefined;
+    }
     async getCommitHash(branch) {
         return this.execGit(`rev-parse ${branch}`);
     }
@@ -132,48 +196,92 @@ class GitService {
         return current === branch;
     }
     async getChangedFiles(source, target) {
-        // If target is the current branch, compare against working tree (includes uncommitted changes)
+        // Same branch = review uncommitted WIP (staged + unstaged) vs HEAD.
+        // Compare == current branch = include working-tree edits vs base.
+        // Otherwise = commit range base...compare.
         const isWorkingTree = await this.isCurrentBranch(target);
-        const diffCmd = isWorkingTree
-            ? `diff --name-status ${source}`
-            : `diff --name-status ${source}...${target}`;
-        const output = await this.execGit(diffCmd);
-        if (!output.trim()) {
-            return [];
+        let diffCmd;
+        if (source === target) {
+            // Always HEAD vs working tree of the current checkout (mode switch, not branch identity).
+            diffCmd = 'diff --name-status HEAD';
         }
-        return output.trim().split('\n').map(line => {
-            const parts = line.split('\t');
-            const statusChar = parts[0].charAt(0);
-            const filePath = parts[1];
-            const oldFilePath = parts.length > 2 ? parts[1] : undefined;
-            const actualPath = parts.length > 2 ? parts[2] : parts[1];
-            let status;
-            switch (statusChar) {
-                case 'A':
-                    status = 'added';
-                    break;
-                case 'D':
-                    status = 'deleted';
-                    break;
-                case 'R':
-                    status = 'renamed';
-                    break;
-                default:
-                    status = 'modified';
-                    break;
+        else if (isWorkingTree) {
+            diffCmd = `diff --name-status ${source}`;
+        }
+        else {
+            diffCmd = `diff --name-status ${source}...${target}`;
+        }
+        const output = await this.execGit(diffCmd);
+        const files = [];
+        if (output.trim()) {
+            for (const line of output.trim().split('\n')) {
+                const parts = line.split('\t');
+                const statusChar = parts[0].charAt(0);
+                const oldFilePath = parts.length > 2 ? parts[1] : undefined;
+                const actualPath = parts.length > 2 ? parts[2] : parts[1];
+                let status;
+                switch (statusChar) {
+                    case 'A':
+                        status = 'added';
+                        break;
+                    case 'D':
+                        status = 'deleted';
+                        break;
+                    case 'R':
+                        status = 'renamed';
+                        break;
+                    default:
+                        status = 'modified';
+                        break;
+                }
+                files.push({
+                    status,
+                    filePath: actualPath,
+                    oldFilePath: status === 'renamed' ? oldFilePath : undefined,
+                });
             }
-            return {
-                status,
-                filePath: actualPath,
-                oldFilePath: status === 'renamed' ? oldFilePath : undefined,
-            };
-        });
+        }
+        // Same-branch WIP review: also surface untracked files (git diff omits them).
+        if (source === target) {
+            const untracked = await this.execGit('ls-files --others --exclude-standard');
+            const seen = new Set(files.map(f => f.filePath));
+            for (const filePath of untracked.trim().split('\n')) {
+                if (!filePath || seen.has(filePath)) {
+                    continue;
+                }
+                files.push({ status: 'added', filePath });
+            }
+        }
+        return files;
     }
-    getFileUri(ref, filePath) {
-        // Use git show to create a URI for the file at a specific ref
-        return vscode.Uri.parse(`git-local-review://authority/${filePath}?ref=${encodeURIComponent(ref)}`);
+    getFileUri(ref, filePath, side) {
+        const q = new URLSearchParams({ ref });
+        if (side) {
+            q.set('side', side);
+        }
+        return vscode.Uri.parse(`git-local-review://authority/${filePath}?${q.toString()}`);
+    }
+    /** Virtual ref for on-disk working tree (avoids file:// so other comment providers don't compete). */
+    static get WORKTREE_REF() {
+        return 'WORKTREE';
+    }
+    getWorkingTreeFileUri(filePath) {
+        return this.getFileUri(GitService.WORKTREE_REF, filePath, 'modified');
     }
     async getFileContent(ref, filePath) {
+        if (ref === GitService.WORKTREE_REF) {
+            try {
+                const abs = path.resolve(this.workspaceRoot, filePath);
+                const root = path.resolve(this.workspaceRoot);
+                if (abs !== root && !abs.startsWith(root + path.sep)) {
+                    return '';
+                }
+                return fs.readFileSync(abs, 'utf-8');
+            }
+            catch {
+                return '';
+            }
+        }
         try {
             return await this.execGit(`show ${ref}:${filePath}`);
         }
@@ -197,6 +305,23 @@ class GitService {
         catch {
             return [];
         }
+    }
+    execGitFile(args, timeout = 3000) {
+        return new Promise((resolve, reject) => {
+            cp.execFile('git', args, {
+                cwd: this.workspaceRoot,
+                maxBuffer: 10 * 1024 * 1024,
+                timeout,
+                env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+            }, (error, stdout, stderr) => {
+                if (error) {
+                    reject(new Error(stderr || error.message));
+                }
+                else {
+                    resolve(stdout);
+                }
+            });
+        });
     }
     execGit(args) {
         return new Promise((resolve, reject) => {

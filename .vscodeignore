@@ -1,0 +1,7 @@
+.vscode/**
+.grok/**
+*.vsix
+bug.md
+.gitignore
+resources/screenshots/**
+resources/graphs/**

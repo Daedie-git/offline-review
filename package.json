@@ -1,26 +1,32 @@
 {
-  "name": "local-pr-review",
-  "displayName": "Local PR Review",
-  "description": "Review your own code changes locally with inline comments — no GitHub or remote needed.",
-  "version": "0.2.3",
-  "publisher": "Gururagavendra",
+  "name": "offline-review",
+  "displayName": "Offline Review",
+  "description": "Review uncommitted changes and branch diffs locally with inline comments \u2014 no remote needed.",
+  "version": "0.1.0",
+  "publisher": "Daedie",
+  "author": "Daedie",
   "icon": "resources/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Gururagavendra/vscode-local-pr-reviewer"
+    "url": "https://github.com/Daedie-git/offline-review"
   },
-  "homepage": "https://github.com/Gururagavendra/vscode-local-pr-reviewer#readme",
+  "homepage": "https://github.com/Daedie-git/offline-review#readme",
   "bugs": {
-    "url": "https://github.com/Gururagavendra/vscode-local-pr-reviewer/issues"
+    "url": "https://github.com/Daedie-git/offline-review/issues"
   },
   "license": "MIT",
   "keywords": [
     "git",
-    "pull request",
+    "offline review",
+    "local review",
+    "local code review",
     "code review",
+    "agent review",
+    "agent code review",
     "diff",
     "comments",
     "offline",
+    "review",
     "local"
   ],
   "engines": {
@@ -54,9 +60,9 @@
     "languageModelTools": [
       {
         "name": "localPrReview_getComments",
-        "displayName": "Get Local Review Comments",
-        "toolReferenceName": "localReviewComments",
-        "modelDescription": "Retrieves local code review comments stored by the 'Local PR Review' VS Code extension. This is NOT related to GitHub Pull Requests or any remote service. These are offline, local-only review comments that users create in diff views within VS Code. Call this tool when the user mentions: local comments, local review, review comments, self-review, check comments, local PR comments. The tool auto-detects the active review from the current git branch. If no review exists, tell the user to create one using the Local PR Review sidebar. Do NOT search the filesystem or run terminal commands to find comments — this tool is the ONLY way to access local review comments.",
+        "displayName": "Get Offline Review Comments",
+        "toolReferenceName": "offlineReviewComments",
+        "modelDescription": "Retrieves local code review comments stored by the 'Offline Review' VS Code extension. This is NOT related to GitHub Pull Requests or any remote service. These are offline, local-only review comments that users create in diff views within VS Code. Call this tool when the user mentions: local comments, local review, review comments, self-review, check comments, local PR comments. The tool auto-detects the active review from the current git branch. If no review exists, tell the user to create one using the Offline Review sidebar. Do NOT search the filesystem or run terminal commands to find comments \u2014 this tool is the ONLY way to access local review comments.",
         "icon": "$(comment-discussion)",
         "canBeReferencedInPrompt": true,
         "inputSchema": {
@@ -82,7 +88,7 @@
       "activitybar": [
         {
           "id": "localPrReview",
-          "title": "Local PR Review",
+          "title": "Offline Review",
           "icon": "resources/icon.svg"
         }
       ]
@@ -100,25 +106,15 @@
         },
         {
           "id": "localPrReview.localPrs",
-          "name": "Local PRs"
+          "name": "Reviews"
         },
         {
           "id": "localPrReview.localComments",
-          "name": "Local Comments"
+          "name": "Review Comments"
         }
       ]
     },
     "commands": [
-      {
-        "command": "localPrReview.selectSource",
-        "title": "Select Base Branch",
-        "icon": "$(git-branch)"
-      },
-      {
-        "command": "localPrReview.selectDestination",
-        "title": "Select Compare Branch",
-        "icon": "$(search)"
-      },
       {
         "command": "localPrReview.refreshComments",
         "title": "Refresh Comments",
@@ -135,8 +131,28 @@
         "icon": "$(add)"
       },
       {
+        "command": "localPrReview.reviewUncommitted",
+        "title": "Review Uncommitted Changes",
+        "icon": "$(git-commit)"
+      },
+      {
+        "command": "localPrReview.reviewActiveBranch",
+        "title": "Review Active Branch",
+        "icon": "$(git-branch)"
+      },
+      {
         "command": "localPrReview.deleteReview",
         "title": "Delete Review",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "localPrReview.clearActiveReview",
+        "title": "Clear Active Review",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "localPrReview.clearAllReviews",
+        "title": "Clear All Reviews",
         "icon": "$(trash)"
       },
       {

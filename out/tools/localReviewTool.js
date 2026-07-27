@@ -43,10 +43,10 @@ class LocalReviewTool {
     }
     async prepareInvocation(options, _token) {
         const confirmationMessages = {
-            title: 'Get Local Review Comments',
-            message: new vscode.MarkdownString(`Retrieve local review comments${options.input.filePath ? ` for **${options.input.filePath}**` : ''}${options.input.state ? ` (${options.input.state} only)` : ''}?`),
+            title: 'Get Offline Review Comments',
+            message: new vscode.MarkdownString(`Retrieve offline review comments${options.input.filePath ? ` for **${options.input.filePath}**` : ''}${options.input.state ? ` (${options.input.state} only)` : ''}?`),
         };
-        return { invocationMessage: 'Checking local review comments...', confirmationMessages };
+        return { invocationMessage: 'Checking offline review comments...', confirmationMessages };
     }
     async invoke(options, _token) {
         const { filePath, state } = options.input;
@@ -54,11 +54,11 @@ class LocalReviewTool {
         const review = await this.resolveReview();
         if (!review) {
             return new vscode.LanguageModelToolResult([
-                new vscode.LanguageModelTextPart('No local review exists for the current git branch. '
-                    + 'Tell the user: "No local review found. Open the **Local PR Review** sidebar (activity bar icon), '
-                    + 'select a base and compare branch, then click Create Review. '
-                    + 'After that, you can add comments in diff views and ask me to check them." '
-                    + 'Do NOT search the filesystem or run any commands — local review data is only accessible through this tool.'),
+                new vscode.LanguageModelTextPart('No offline review exists for the current git branch. '
+                    + 'Tell the user: "No offline review found. Open the **Offline Review** sidebar (activity bar icon), '
+                    + 'pick Uncommitted or Active branch, then add comments in the diff views. '
+                    + 'After that, you can ask me to check them." '
+                    + 'Do NOT search the filesystem or run any commands — offline review data is only accessible through this tool.'),
             ]);
         }
         // Temporarily set as active to read comments
@@ -74,7 +74,7 @@ class LocalReviewTool {
                 new vscode.LanguageModelTextPart(`Review found: ${review.targetBranch} -> ${review.sourceBranch}. `
                     + 'However, there are no comments yet. '
                     + 'Tell the user: "Your review has no comments yet. Open a file from the Changed Files list '
-                    + 'in the Local PR Review sidebar, then click the + icon in the diff gutter to add a comment." '
+                    + 'in the Offline Review sidebar, then click the + icon in the diff gutter to add a comment." '
                     + 'Do NOT search the filesystem or run any commands.'),
             ]);
         }
@@ -113,16 +113,17 @@ class LocalReviewTool {
         ]);
     }
     async resolveReview() {
-        // Try auto-detect from current git branch
+        // Prefer the active review — Uncommitted and Active-branch are separate
+        // buckets that can both match the current branch name.
+        const active = this.localPrManager.getActiveReview();
+        if (active) {
+            return active;
+        }
         const currentBranch = await this.gitService.getCurrentBranch();
         if (currentBranch) {
-            const review = this.localPrManager.findReviewByBranch(currentBranch);
-            if (review) {
-                return review;
-            }
+            return this.localPrManager.findReviewByBranch(currentBranch);
         }
-        // Fall back to active review
-        return this.localPrManager.getActiveReview();
+        return undefined;
     }
 }
 exports.LocalReviewTool = LocalReviewTool;

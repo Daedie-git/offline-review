@@ -60,7 +60,11 @@ class LocalPrsProvider {
 exports.LocalPrsProvider = LocalPrsProvider;
 class LocalPrItem extends vscode.TreeItem {
     constructor(review, isActive) {
-        super(`${review.targetBranch} -> ${review.sourceBranch}`, vscode.TreeItemCollapsibleState.None);
+        const uncommitted = review.sourceBranch === review.targetBranch;
+        const label = uncommitted
+            ? `uncommitted (${review.targetBranch})`
+            : `${review.targetBranch} vs ${review.sourceBranch}`;
+        super(label, vscode.TreeItemCollapsibleState.None);
         this.review = review;
         this.tooltip = `Created: ${new Date(review.createdAt).toLocaleString()}`;
         this.contextValue = 'localPr';
@@ -69,7 +73,7 @@ class LocalPrItem extends vscode.TreeItem {
             this.iconPath = new vscode.ThemeIcon('check', new vscode.ThemeColor('charts.green'));
         }
         else {
-            this.iconPath = new vscode.ThemeIcon('git-pull-request');
+            this.iconPath = new vscode.ThemeIcon(uncommitted ? 'git-commit' : 'git-pull-request');
         }
         // Click to activate
         this.command = {

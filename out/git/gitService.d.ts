@@ -15,6 +15,7 @@ export declare class GitService {
     private _trackBranchChanges;
     getBranches(includeRemote?: boolean): Promise<string[]>;
     getCurrentBranch(): Promise<string | undefined>;
+    getPrimaryBranch(branches?: string[], excludeBranch?: string): Promise<string | undefined>;
     getCommitHash(branch: string): Promise<string>;
     isCurrentBranch(branch: string): Promise<boolean>;
     getChangedFiles(source: string, target: string): Promise<FileChange[]>;

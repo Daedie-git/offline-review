@@ -1,1 +1,0 @@
-cool it is workig now push thhe changes to github and make an new release and give me the neew packae so i can update to vscde extension

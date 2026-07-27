@@ -35,9 +35,10 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.GitFileContentProvider = void 0;
 const vscode = __importStar(require("vscode"));
+const gitService_1 = require("./gitService");
 /**
  * Provides file content from a specific git ref via a custom URI scheme.
- * URI format: git-local-review://authority/{filePath}?ref={branch}
+ * URI format: git-local-review://authority/{filePath}?ref={branch|WORKTREE}
  */
 class GitFileContentProvider {
     constructor(gitService) {
@@ -53,6 +54,21 @@ class GitFileContentProvider {
             return '';
         }
         return this.gitService.getFileContent(ref, filePath);
+    }
+    /** Invalidate a cached WORKTREE virtual document so the diff right pane refreshes. */
+    refreshWorkingTreeFile(filePath) {
+        this._onDidChange.fire(this.gitService.getWorkingTreeFileUri(filePath));
+    }
+    refreshAllWorkingTree() {
+        for (const doc of vscode.workspace.textDocuments) {
+            if (doc.uri.scheme !== 'git-local-review') {
+                continue;
+            }
+            const ref = new URLSearchParams(doc.uri.query).get('ref');
+            if (ref === gitService_1.GitService.WORKTREE_REF) {
+                this._onDidChange.fire(doc.uri);
+            }
+        }
     }
     dispose() {
         this._onDidChange.dispose();

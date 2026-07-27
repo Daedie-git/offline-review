@@ -40,6 +40,52 @@ const crypto = __importStar(require("crypto"));
 class StorageService {
     constructor(localPrManager) {
         this.localPrManager = localPrManager;
+        // Wall-clock ms; comments.json watcher should ignore own writes until then.
+        this.suppressWatcherUntil = 0;
+        this._ignoreWatchDepth = 0;
+    }
+    markOwnWrite(serializedContent) {
+        if (typeof serializedContent === 'string') {
+            this._lastWrittenHash = crypto.createHash('sha1').update(serializedContent).digest('hex');
+        }
+        // Short race window only; content hash is the real own-write filter.
+        this.suppressWatcherUntil = Date.now() + 300;
+        this._ignoreWatchDepth = (this._ignoreWatchDepth || 0) + 1;
+        setTimeout(() => {
+            this._ignoreWatchDepth = Math.max(0, (this._ignoreWatchDepth || 1) - 1);
+        }, 0);
+    }
+    shouldIgnoreWatch(fsPath) {
+        if ((this._ignoreWatchDepth || 0) > 0) {
+            return true;
+        }
+        if (fsPath && this._lastWrittenHash && fs.existsSync(fsPath)) {
+            try {
+                const hash = crypto.createHash('sha1').update(fs.readFileSync(fsPath)).digest('hex');
+                if (hash === this._lastWrittenHash) {
+                    return true;
+                }
+            }
+            catch {
+                // fall through
+            }
+        }
+        return Date.now() < (this.suppressWatcherUntil || 0);
+    }
+    msUntilWatchAllowed() {
+        return Math.max(0, (this.suppressWatcherUntil || 0) - Date.now());
+    }
+    async withWatchSuppressed(fn) {
+        this.suppressWatcherUntil = Date.now() + 5000;
+        this._ignoreWatchDepth = (this._ignoreWatchDepth || 0) + 1;
+        try {
+            return await fn();
+        }
+        finally {
+            setTimeout(() => {
+                this._ignoreWatchDepth = Math.max(0, (this._ignoreWatchDepth || 1) - 1);
+            }, 800);
+        }
     }
     loadComments() {
         const review = this.localPrManager.getActiveReview();
@@ -68,17 +114,20 @@ class StorageService {
     saveComments(comments) {
         const review = this.localPrManager.getActiveReview();
         if (!review) {
-            return;
+            throw new Error('No active Offline Review — pick Uncommitted or Active branch first');
         }
         const filePath = this.localPrManager.getCommentsFilePath(review);
         // If no threads, delete the file and directory instead of writing empty data
         if (comments.threads.length === 0) {
+            this.markOwnWrite('');
             if (fs.existsSync(filePath)) {
                 fs.unlinkSync(filePath);
                 const dir = path.dirname(filePath);
-                const remaining = fs.readdirSync(dir);
-                if (remaining.length === 0) {
-                    fs.rmdirSync(dir);
+                if (fs.existsSync(dir)) {
+                    const remaining = fs.readdirSync(dir);
+                    if (remaining.length === 0) {
+                        fs.rmdirSync(dir);
+                    }
                 }
             }
             return;
@@ -87,7 +136,35 @@ class StorageService {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
-        fs.writeFileSync(filePath, JSON.stringify(comments, null, 2), 'utf-8');
+        const serialized = JSON.stringify(comments, null, 2);
+        this.markOwnWrite(serialized);
+        fs.writeFileSync(filePath, serialized, 'utf-8');
+    }
+    /** Ensure the active review has a comments.json shell (empty threads ok). */
+    ensureCommentsFile() {
+        const review = this.localPrManager.getActiveReview();
+        if (!review) {
+            return;
+        }
+        const filePath = this.localPrManager.getCommentsFilePath(review);
+        if (fs.existsSync(filePath)) {
+            return;
+        }
+        const dir = path.dirname(filePath);
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        const shell = {
+            version: 1,
+            sourceBranch: review.sourceBranch,
+            targetBranch: review.targetBranch,
+            sourceCommit: review.sourceCommit,
+            targetCommit: review.targetCommit,
+            threads: [],
+        };
+        const serialized = JSON.stringify(shell, null, 2);
+        this.markOwnWrite(serialized);
+        fs.writeFileSync(filePath, serialized, 'utf-8');
     }
     addThread(filePath, startLine, endLine, body, author) {
         const comments = this.loadComments();
