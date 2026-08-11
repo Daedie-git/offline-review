@@ -47,35 +47,54 @@ function getLiveWorktreeUri(virtualUri) {
     return vscode.Uri.joinPath(vscode.Uri.file(parsed.worktreeRoot), parsed.filePath);
 }
 /**
- * Forward language navigation only from live WORKTREE documents to the
- * corresponding file captured by the prepared DiffPlan. Immutable Git snapshots
- * are not forwarded because their contents and line positions may differ from
- * every checked-out file.
+ * Forward language navigation from coordinate-equivalent modified documents to
+ * the corresponding file in the checkout captured by the prepared DiffPlan.
+ * Immutable Git snapshots are eligible only while their exact text still
+ * matches that real document; stale snapshots and original sides fail closed.
  */
 function registerVirtualDocLanguageFeatures(context, gitService) {
     const selector = { scheme: 'git-local-review' };
-    const ensureRealUri = async (virtualUri) => {
-        const parsed = (0, gitService_1.parseDiffDocumentUri)(virtualUri);
-        const realUri = getLiveWorktreeUri(virtualUri);
-        if (!parsed?.worktreeRoot || !realUri
+    const prepareTarget = async (virtualDocument, position, token) => {
+        const parsed = (0, gitService_1.parseDiffDocumentUri)(virtualDocument.uri);
+        if (!parsed || parsed.side !== 'modified' || !parsed.worktreeRoot
+            || token.isCancellationRequested
+            || !isValidPosition(virtualDocument, position)
             || !await gitService.isLinkedWorktreeRoot(parsed.worktreeRoot)) {
             return undefined;
         }
+        const realUri = vscode.Uri.joinPath(vscode.Uri.file(parsed.worktreeRoot), parsed.filePath);
         try {
-            await vscode.workspace.openTextDocument(realUri);
-            return realUri;
+            const realDocument = await vscode.workspace.openTextDocument(realUri);
+            if (token.isCancellationRequested
+                || realDocument.uri.toString() !== realUri.toString()
+                || !isValidPosition(realDocument, position)
+                || virtualDocument.getText() !== realDocument.getText()) {
+                return undefined;
+            }
+            return {
+                realUri,
+                realDocument,
+                virtualVersion: virtualDocument.version,
+                realVersion: realDocument.version,
+            };
         }
         catch {
             return undefined;
         }
     };
-    const locations = (command) => async (document, position) => {
-        const realUri = await ensureRealUri(document.uri);
-        if (!realUri) {
+    const targetIsCurrent = (target, virtualDocument, token) => !token.isCancellationRequested
+        && virtualDocument.version === target.virtualVersion
+        && target.realDocument.version === target.realVersion
+        && virtualDocument.getText() === target.realDocument.getText();
+    const execute = async (command, document, position, token) => {
+        const target = await prepareTarget(document, position, token);
+        if (!target) {
             return undefined;
         }
-        return vscode.commands.executeCommand(command, realUri, position);
+        const result = await vscode.commands.executeCommand(command, target.realUri, position);
+        return targetIsCurrent(target, document, token) ? result : undefined;
     };
+    const locations = (command) => async (document, position, token) => execute(command, document, position, token);
     context.subscriptions.push(vscode.languages.registerDefinitionProvider(selector, {
         provideDefinition: locations('vscode.executeDefinitionProvider'),
     }), vscode.languages.registerTypeDefinitionProvider(selector, {
@@ -83,22 +102,20 @@ function registerVirtualDocLanguageFeatures(context, gitService) {
     }), vscode.languages.registerImplementationProvider(selector, {
         provideImplementation: locations('vscode.executeImplementationProvider'),
     }), vscode.languages.registerReferenceProvider(selector, {
-        async provideReferences(document, position) {
-            const realUri = await ensureRealUri(document.uri);
-            if (!realUri) {
-                return undefined;
-            }
-            return vscode.commands.executeCommand('vscode.executeReferenceProvider', realUri, position);
+        provideReferences(document, position, _context, token) {
+            return execute('vscode.executeReferenceProvider', document, position, token);
         },
     }), vscode.languages.registerHoverProvider(selector, {
-        async provideHover(document, position) {
-            const realUri = await ensureRealUri(document.uri);
-            if (!realUri) {
-                return undefined;
-            }
-            const hovers = await vscode.commands.executeCommand('vscode.executeHoverProvider', realUri, position);
+        async provideHover(document, position, token) {
+            const hovers = await execute('vscode.executeHoverProvider', document, position, token);
             return hovers?.[0];
         },
     }));
+}
+function isValidPosition(document, position) {
+    if (position.line < 0 || position.line >= document.lineCount || position.character < 0) {
+        return false;
+    }
+    return position.character <= document.lineAt(position.line).text.length;
 }
 //# sourceMappingURL=virtualDocLanguageFeatures.js.map

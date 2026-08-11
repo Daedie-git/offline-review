@@ -1076,7 +1076,35 @@ test('ordinary-editor controller and provider support healthy workspace comments
     assert.equal(storage.load().threads[0].sourceAnchor, 'alpha\nbeta');
     controller.addReply(renderedThread, 'reply after an unrelated review transition');
     const replyComment = renderedThread.comments[1];
-    controller.saveEditedComment(renderedThread, replyComment, 'edited by stable UUID');
+    // Simulate the in-place editor: VS Code updates body on the comment object.
+    replyComment.mode = vscode.CommentMode.Editing;
+    replyComment.body = 'edited by stable UUID';
+    controller.saveEditedComment(
+        renderedThread,
+        replyComment,
+        typeof replyComment.body === 'string' ? replyComment.body : replyComment.body.value
+    );
+    assert.equal(renderedThread.comments[1].mode, vscode.CommentMode.Preview);
+    assert.equal(
+        typeof renderedThread.comments[1].body === 'string'
+            ? renderedThread.comments[1].body
+            : renderedThread.comments[1].body.value,
+        'edited by stable UUID'
+    );
+
+    // Cancel must restore the stored body, not keep the draft UI text.
+    const firstComment = renderedThread.comments[0];
+    firstComment.mode = vscode.CommentMode.Editing;
+    firstComment.body = 'unsaved draft that must be discarded';
+    controller.discardCommentEdits(renderedThread);
+    assert.equal(renderedThread.comments[0].mode, vscode.CommentMode.Preview);
+    assert.equal(
+        typeof renderedThread.comments[0].body === 'string'
+            ? renderedThread.comments[0].body
+            : renderedThread.comments[0].body.value,
+        'ordinary comment'
+    );
+
     controller.resolveThread(renderedThread);
     controller.loadAllThreads();
     assert.equal(storage.load().threads[0].id, savedId);

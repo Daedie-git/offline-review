@@ -270,6 +270,11 @@ class ReviewCommentController {
         return thread.comments.map(comment => this.toVscodeComment(reviewId, thread.id, comment));
     }
     toVscodeComment(reviewId, threadId, comment) {
+        const identity = {
+            reviewId,
+            threadId,
+            commentId: comment.id,
+        };
         const rendered = {
             body: new vscode.MarkdownString(comment.body),
             author: { name: comment.author },
@@ -277,13 +282,35 @@ class ReviewCommentController {
             contextValue: 'canEdit',
             timestamp: new Date(comment.timestamp),
             label: undefined,
+            __offlineReviewId: reviewId,
+            __offlineThreadId: threadId,
+            __offlineCommentId: comment.id,
         };
-        this.commentIdentities.set(rendered, {
-            reviewId,
-            threadId,
-            commentId: comment.id,
-        });
+        this.commentIdentities.set(rendered, identity);
         return rendered;
+    }
+    resolveCommentIdentity(comment, threadData) {
+        const fromMap = this.commentIdentities.get(comment);
+        if (fromMap
+            && (!threadData
+                || (fromMap.reviewId === threadData.reviewId
+                    && fromMap.threadId === threadData.threadId))) {
+            return fromMap;
+        }
+        const tagged = comment;
+        if (tagged.__offlineCommentId
+            && tagged.__offlineThreadId
+            && tagged.__offlineReviewId
+            && (!threadData
+                || (tagged.__offlineReviewId === threadData.reviewId
+                    && tagged.__offlineThreadId === threadData.threadId))) {
+            return {
+                reviewId: tagged.__offlineReviewId,
+                threadId: tagged.__offlineThreadId,
+                commentId: tagged.__offlineCommentId,
+            };
+        }
+        return undefined;
     }
     resolveThread(thread) {
         const managed = thread;
@@ -326,15 +353,12 @@ class ReviewCommentController {
     saveEditedComment(thread, comment, newBody) {
         const managed = thread;
         const threadData = managed.__threadData;
-        const identity = this.commentIdentities.get(comment);
-        if (!threadData
-            || !identity
-            || identity.reviewId !== threadData.reviewId
-            || identity.threadId !== threadData.threadId) {
-            return;
+        const identity = this.resolveCommentIdentity(comment, threadData);
+        if (!threadData || !identity) {
+            throw new Error('Could not match the edited comment to stored review data');
         }
         if (!this.storageService.editComment(identity.reviewId, identity.threadId, identity.commentId, newBody)) {
-            return;
+            throw new Error('Could not save the edited comment');
         }
         const refreshed = this.storageService
             .loadCommentsForReview(identity.reviewId)?.threads
@@ -344,14 +368,25 @@ class ReviewCommentController {
             thread.comments = this.toVscodeComments(identity.reviewId, refreshed);
         }
     }
+    /** Reload thread comments from storage, discarding in-progress edit UI state. */
+    discardCommentEdits(thread) {
+        const managed = thread;
+        const threadData = managed.__threadData;
+        if (!threadData) {
+            return;
+        }
+        const refreshed = this.storageService
+            .loadCommentsForReview(threadData.reviewId)?.threads
+            .find(candidate => candidate.id === threadData.threadId);
+        if (refreshed) {
+            thread.comments = this.toVscodeComments(threadData.reviewId, refreshed);
+        }
+    }
     deleteComment(thread, comment) {
         const managed = thread;
         const threadData = managed.__threadData;
-        const identity = this.commentIdentities.get(comment);
-        if (!threadData
-            || !identity
-            || identity.reviewId !== threadData.reviewId
-            || identity.threadId !== threadData.threadId) {
+        const identity = this.resolveCommentIdentity(comment, threadData);
+        if (!threadData || !identity) {
             return;
         }
         const storedThread = this.storageService
@@ -398,7 +433,7 @@ class ReviewCommentController {
                 return parent;
             }
         }
-        const identity = this.commentIdentities.get(comment);
+        const identity = this.resolveCommentIdentity(comment, undefined);
         if (identity) {
             for (const thread of this.threads.values()) {
                 if (thread.__threadData?.reviewId === identity.reviewId

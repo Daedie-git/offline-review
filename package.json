@@ -2,7 +2,7 @@
   "name": "offline-review",
   "displayName": "Offline Review",
   "description": "Review diffs and annotate workspace code locally with offline inline comments — no remote needed.",
-  "version": "0.2.2",
+  "version": "0.2.6",
   "publisher": "Daedie",
   "author": "Daedie",
   "icon": "resources/icon.png",
@@ -223,6 +223,10 @@
         "title": "Add Comment"
       },
       {
+        "command": "localPrReview.replyComment",
+        "title": "Reply"
+      },
+      {
         "command": "localPrReview.saveComment",
         "title": "Save"
       },
@@ -273,6 +277,10 @@
       {
         "command": "localPrReview.addCodeComment",
         "title": "Add Code Comment"
+      },
+      {
+        "command": "localPrReview.replyCodeComment",
+        "title": "Reply"
       },
       {
         "command": "localPrReview.saveCodeComment",
@@ -370,19 +378,19 @@
           "when": "commentController == localPrReview && commentThreadIsEmpty"
         },
         {
-          "command": "localPrReview.saveComment",
+          "command": "localPrReview.replyComment",
           "group": "inline@1",
-          "when": "commentController == localPrReview"
+          "when": "commentController == localPrReview && !commentThreadIsEmpty"
         },
         {
           "command": "localPrReview.cancelComment",
           "group": "inline@2",
-          "when": "commentController == localPrReview"
+          "when": "commentController == localPrReview && commentThreadIsEmpty"
         },
         {
           "command": "localPrReview.suggestChange",
           "group": "inline@3",
-          "when": "commentController == localPrReview && commentThread == unresolved"
+          "when": "commentController == localPrReview && !commentThreadIsEmpty && commentThread == unresolved"
         },
         {
           "command": "localPrReview.addCodeComment",
@@ -390,14 +398,14 @@
           "when": "commentController == localCodeComments && commentThreadIsEmpty"
         },
         {
-          "command": "localPrReview.saveCodeComment",
+          "command": "localPrReview.replyCodeComment",
           "group": "inline@1",
-          "when": "commentController == localCodeComments"
+          "when": "commentController == localCodeComments && !commentThreadIsEmpty"
         },
         {
           "command": "localPrReview.cancelCodeComment",
           "group": "inline@2",
-          "when": "commentController == localCodeComments"
+          "when": "commentController == localCodeComments && commentThreadIsEmpty"
         }
       ],
       "comments/comment/title": [
@@ -420,6 +428,28 @@
           "command": "localPrReview.deleteCodeComment",
           "group": "inline@2",
           "when": "commentController == localCodeComments && comment == canEdit"
+        }
+      ],
+      "comments/comment/context": [
+        {
+          "command": "localPrReview.saveComment",
+          "group": "inline@1",
+          "when": "commentController == localPrReview"
+        },
+        {
+          "command": "localPrReview.cancelComment",
+          "group": "inline@2",
+          "when": "commentController == localPrReview"
+        },
+        {
+          "command": "localPrReview.saveCodeComment",
+          "group": "inline@1",
+          "when": "commentController == localCodeComments"
+        },
+        {
+          "command": "localPrReview.cancelCodeComment",
+          "group": "inline@2",
+          "when": "commentController == localCodeComments"
         }
       ],
       "comments/commentThread/title": [

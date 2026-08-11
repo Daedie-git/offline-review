@@ -131,11 +131,20 @@ class ThemeColor {
 
 const createdCommentThreads = [];
 const createdCommentControllers = [];
+const registeredLanguageProviders = {
+    definitions: [],
+    typeDefinitions: [],
+    implementations: [],
+    references: [],
+    hovers: [],
+};
 
 async function defaultOpenTextDocument(uri) {
     return {
         uri,
+        version: 1,
         lineCount: 100,
+        getText() { return ''; },
         lineAt() {
             return { text: '', range: { end: { character: 0 } } };
         },
@@ -165,6 +174,31 @@ const vscode = {
         openTextDocument: defaultOpenTextDocument,
         asRelativePath(uri) {
             return uri.fsPath;
+        },
+    },
+    commands: {
+        async executeCommand() { return undefined; },
+    },
+    languages: {
+        registerDefinitionProvider(selector, provider) {
+            registeredLanguageProviders.definitions.push({ selector, provider });
+            return new Disposable();
+        },
+        registerTypeDefinitionProvider(selector, provider) {
+            registeredLanguageProviders.typeDefinitions.push({ selector, provider });
+            return new Disposable();
+        },
+        registerImplementationProvider(selector, provider) {
+            registeredLanguageProviders.implementations.push({ selector, provider });
+            return new Disposable();
+        },
+        registerReferenceProvider(selector, provider) {
+            registeredLanguageProviders.references.push({ selector, provider });
+            return new Disposable();
+        },
+        registerHoverProvider(selector, provider) {
+            registeredLanguageProviders.hovers.push({ selector, provider });
+            return new Disposable();
         },
     },
     comments: {
@@ -203,6 +237,7 @@ const vscode = {
     },
     __createdCommentThreads: createdCommentThreads,
     __createdCommentControllers: createdCommentControllers,
+    __registeredLanguageProviders: registeredLanguageProviders,
     window: {
         showErrorMessage() {},
         showWarningMessage() {},
@@ -224,8 +259,12 @@ function installVscodeMock(workspaceRoot) {
         : [];
     vscode.workspace.textDocuments = [];
     vscode.workspace.openTextDocument = defaultOpenTextDocument;
+    vscode.commands.executeCommand = async () => undefined;
     createdCommentThreads.length = 0;
     createdCommentControllers.length = 0;
+    for (const providers of Object.values(registeredLanguageProviders)) {
+        providers.length = 0;
+    }
     if (!installed) {
         originalLoad = Module._load;
         Module._load = function patchedLoad(request, parent, isMain) {

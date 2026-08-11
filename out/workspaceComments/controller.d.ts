@@ -23,6 +23,8 @@ export declare class WorkspaceCommentController {
     resolveThread(thread: vscode.CommentThread): void;
     unresolveThread(thread: vscode.CommentThread): void;
     saveEditedComment(thread: vscode.CommentThread, comment: vscode.Comment, body: string): void;
+    /** Reload thread comments from storage, discarding in-progress edit UI state. */
+    discardCommentEdits(thread: vscode.CommentThread): void;
     deleteComment(thread: vscode.CommentThread, comment: vscode.Comment): void;
     findThreadForComment(comment: vscode.Comment): vscode.CommentThread | undefined;
     dispose(): void;
@@ -33,6 +35,7 @@ export declare class WorkspaceCommentController {
     private refreshThreadComments;
     private requireThreadId;
     private requireCommentIdentity;
+    private resolveCommentIdentity;
     private toVscodeComments;
     private toVscodeComment;
 }

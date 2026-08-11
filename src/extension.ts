@@ -1006,21 +1006,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
         ),
         vscode.commands.registerCommand(
-            'localPrReview.saveComment',
+            'localPrReview.replyComment',
             async (reply: vscode.CommentReply) => {
                 try {
-                    const editing = reply.thread.comments.find(
-                        comment => comment.mode === vscode.CommentMode.Editing
+                    await addOrReply(commentController, reply);
+                    refreshCommentUi();
+                } catch (error: unknown) {
+                    vscode.window.showErrorMessage(
+                        `Failed to reply: ${errorMessage(error)}`
                     );
-                    if (editing) {
-                        commentController.saveEditedComment(
-                            reply.thread,
-                            editing,
-                            reply.text ?? ''
-                        );
-                    } else {
-                        await addOrReply(commentController, reply);
+                }
+            }
+        ),
+        vscode.commands.registerCommand(
+            'localPrReview.saveComment',
+            (comment: vscode.Comment) => {
+                try {
+                    // comments/comment/context: host unmarshals to the Comment
+                    // and already writes the editor text into comment.body.
+                    const thread = resolveReviewCommentThread(
+                        comment,
+                        commentController
+                    );
+                    if (!thread) {
+                        throw new Error('Could not find that comment thread to save');
                     }
+                    commentController.saveEditedComment(
+                        thread,
+                        comment,
+                        commentBodyText(comment)
+                    );
                     refreshCommentUi();
                 } catch (error: unknown) {
                     vscode.window.showErrorMessage(
@@ -1031,9 +1046,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ),
         vscode.commands.registerCommand(
             'localPrReview.cancelComment',
-            (reply: vscode.CommentReply) => {
-                if (reply.thread.comments.length === 0) {
-                    reply.thread.dispose();
+            (arg: vscode.CommentReply | vscode.Comment) => {
+                // Empty-thread draft cancel receives CommentReply.
+                // In-place edit cancel receives the Comment (body may already
+                // hold the discarded draft — reload from storage).
+                if (isCommentReply(arg)) {
+                    if (arg.thread.comments.length === 0) {
+                        arg.thread.dispose();
+                    }
+                    return;
+                }
+                const thread = resolveReviewCommentThread(arg, commentController);
+                if (thread) {
+                    commentController.discardCommentEdits(thread);
                 }
             }
         ),
@@ -1121,21 +1146,34 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
         ),
         vscode.commands.registerCommand(
-            'localPrReview.saveCodeComment',
+            'localPrReview.replyCodeComment',
             async (reply: vscode.CommentReply) => {
                 try {
-                    const editing = reply.thread.comments.find(
-                        comment => comment.mode === vscode.CommentMode.Editing
+                    await addOrReplyWorkspaceComment(workspaceCommentController, reply);
+                    refreshWorkspaceCommentUi();
+                } catch (error: unknown) {
+                    reportWorkspaceCommentFailure('reply', error);
+                }
+            }
+        ),
+        vscode.commands.registerCommand(
+            'localPrReview.saveCodeComment',
+            (comment: vscode.Comment) => {
+                try {
+                    // comments/comment/context: host unmarshals to the Comment
+                    // and already writes the editor text into comment.body.
+                    const thread = resolveWorkspaceCommentThread(
+                        comment,
+                        workspaceCommentController
                     );
-                    if (editing) {
-                        workspaceCommentController.saveEditedComment(
-                            reply.thread,
-                            editing,
-                            reply.text ?? ''
-                        );
-                    } else {
-                        await addOrReplyWorkspaceComment(workspaceCommentController, reply);
+                    if (!thread) {
+                        throw new Error('The comment is stale or no longer available');
                     }
+                    workspaceCommentController.saveEditedComment(
+                        thread,
+                        comment,
+                        commentBodyText(comment)
+                    );
                     refreshWorkspaceCommentUi();
                 } catch (error: unknown) {
                     reportWorkspaceCommentFailure('save', error);
@@ -1144,9 +1182,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ),
         vscode.commands.registerCommand(
             'localPrReview.cancelCodeComment',
-            (reply: vscode.CommentReply) => {
-                if (reply.thread.comments.length === 0) {
-                    reply.thread.dispose();
+            (arg: vscode.CommentReply | vscode.Comment) => {
+                if (isCommentReply(arg)) {
+                    if (arg.thread.comments.length === 0) {
+                        arg.thread.dispose();
+                    }
+                    return;
+                }
+                const thread = resolveWorkspaceCommentThread(
+                    arg,
+                    workspaceCommentController
+                );
+                if (thread) {
+                    workspaceCommentController.discardCommentEdits(thread);
                 }
             }
         ),
@@ -1408,6 +1456,39 @@ async function addOrReply(
     } else {
         controller.addReply(thread, reply.text ?? '');
     }
+}
+
+/** True when the command arg is the thread reply box, not an in-place edit. */
+export function isCommentReply(arg: unknown): arg is vscode.CommentReply {
+    return Boolean(
+        arg
+        && typeof arg === 'object'
+        && 'text' in arg
+        && 'thread' in arg
+        && !('mode' in arg)
+    );
+}
+
+export function commentBodyText(comment: vscode.Comment): string {
+    return typeof comment.body === 'string' ? comment.body : comment.body.value;
+}
+
+function resolveReviewCommentThread(
+    comment: vscode.Comment & { thread?: vscode.CommentThread; parent?: vscode.CommentThread },
+    controller: ReviewCommentController
+): vscode.CommentThread | undefined {
+    return comment.thread
+        ?? comment.parent
+        ?? controller.findThreadForComment(comment);
+}
+
+function resolveWorkspaceCommentThread(
+    comment: vscode.Comment & { thread?: vscode.CommentThread; parent?: vscode.CommentThread },
+    controller: WorkspaceCommentController
+): vscode.CommentThread | undefined {
+    return comment.thread
+        ?? comment.parent
+        ?? controller.findThreadForComment(comment);
 }
 
 export async function addOrReplyWorkspaceComment(

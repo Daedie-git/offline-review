@@ -34,6 +34,13 @@ interface CommentIdentity {
     readonly commentId: string;
 }
 
+/** Stable ids mirrored onto the comment for hosts that re-wrap objects. */
+interface IdentifiedComment extends vscode.Comment {
+    __offlineReviewId?: string;
+    __offlineThreadId?: string;
+    __offlineCommentId?: string;
+}
+
 export class ReviewCommentController {
     private readonly controller: vscode.CommentController;
     private readonly threads = new Map<string, ManagedCommentThread>();
@@ -350,20 +357,51 @@ export class ReviewCommentController {
         threadId: string,
         comment: ReviewComment
     ): vscode.Comment {
-        const rendered: vscode.Comment = {
+        const identity: CommentIdentity = {
+            reviewId,
+            threadId,
+            commentId: comment.id,
+        };
+        const rendered: IdentifiedComment = {
             body: new vscode.MarkdownString(comment.body),
             author: { name: comment.author },
             mode: vscode.CommentMode.Preview,
             contextValue: 'canEdit',
             timestamp: new Date(comment.timestamp),
             label: undefined,
+            __offlineReviewId: reviewId,
+            __offlineThreadId: threadId,
+            __offlineCommentId: comment.id,
         };
-        this.commentIdentities.set(rendered, {
-            reviewId,
-            threadId,
-            commentId: comment.id,
-        });
+        this.commentIdentities.set(rendered, identity);
         return rendered;
+    }
+
+    private resolveCommentIdentity(
+        comment: vscode.Comment,
+        threadData: ThreadData | undefined
+    ): CommentIdentity | undefined {
+        const fromMap = this.commentIdentities.get(comment);
+        if (fromMap
+            && (!threadData
+                || (fromMap.reviewId === threadData.reviewId
+                    && fromMap.threadId === threadData.threadId))) {
+            return fromMap;
+        }
+        const tagged = comment as IdentifiedComment;
+        if (tagged.__offlineCommentId
+            && tagged.__offlineThreadId
+            && tagged.__offlineReviewId
+            && (!threadData
+                || (tagged.__offlineReviewId === threadData.reviewId
+                    && tagged.__offlineThreadId === threadData.threadId))) {
+            return {
+                reviewId: tagged.__offlineReviewId,
+                threadId: tagged.__offlineThreadId,
+                commentId: tagged.__offlineCommentId,
+            };
+        }
+        return undefined;
     }
 
     resolveThread(thread: vscode.CommentThread): void {
@@ -437,12 +475,9 @@ export class ReviewCommentController {
     saveEditedComment(thread: vscode.CommentThread, comment: vscode.Comment, newBody: string): void {
         const managed = thread as ManagedCommentThread;
         const threadData = managed.__threadData;
-        const identity = this.commentIdentities.get(comment);
-        if (!threadData
-            || !identity
-            || identity.reviewId !== threadData.reviewId
-            || identity.threadId !== threadData.threadId) {
-            return;
+        const identity = this.resolveCommentIdentity(comment, threadData);
+        if (!threadData || !identity) {
+            throw new Error('Could not match the edited comment to stored review data');
         }
 
         if (!this.storageService.editComment(
@@ -451,7 +486,7 @@ export class ReviewCommentController {
             identity.commentId,
             newBody
         )) {
-            return;
+            throw new Error('Could not save the edited comment');
         }
         const refreshed = this.storageService
             .loadCommentsForReview(identity.reviewId)?.threads
@@ -466,14 +501,26 @@ export class ReviewCommentController {
         }
     }
 
+    /** Reload thread comments from storage, discarding in-progress edit UI state. */
+    discardCommentEdits(thread: vscode.CommentThread): void {
+        const managed = thread as ManagedCommentThread;
+        const threadData = managed.__threadData;
+        if (!threadData) {
+            return;
+        }
+        const refreshed = this.storageService
+            .loadCommentsForReview(threadData.reviewId)?.threads
+            .find(candidate => candidate.id === threadData.threadId);
+        if (refreshed) {
+            thread.comments = this.toVscodeComments(threadData.reviewId, refreshed);
+        }
+    }
+
     deleteComment(thread: vscode.CommentThread, comment: vscode.Comment): void {
         const managed = thread as ManagedCommentThread;
         const threadData = managed.__threadData;
-        const identity = this.commentIdentities.get(comment);
-        if (!threadData
-            || !identity
-            || identity.reviewId !== threadData.reviewId
-            || identity.threadId !== threadData.threadId) {
+        const identity = this.resolveCommentIdentity(comment, threadData);
+        if (!threadData || !identity) {
             return;
         }
 
@@ -538,7 +585,7 @@ export class ReviewCommentController {
             }
         }
 
-        const identity = this.commentIdentities.get(comment);
+        const identity = this.resolveCommentIdentity(comment, undefined);
         if (identity) {
             for (const thread of this.threads.values()) {
                 if (thread.__threadData?.reviewId === identity.reviewId

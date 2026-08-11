@@ -754,6 +754,120 @@ test('worktree URIs carry prepared identity and file refresh invalidates every m
     provider.dispose();
 });
 
+test('virtual language navigation safely restores matching branch snapshots', async () => {
+    const workspace = '/tmp/offline-review-language-test';
+    installVscodeMock(workspace);
+    const { getDiffDocumentUri } = built('git/gitService');
+    const { registerVirtualDocLanguageFeatures } = built(
+        'language/virtualDocLanguageFeatures'
+    );
+    const reviewId = '77777777-7777-4777-8777-777777777777';
+    const commitId = 'a'.repeat(40);
+    const sourceText = 'fn definition() {}\nfn caller() { definition(); }\n';
+    const textDocument = (uri, text = sourceText, version = 1) => ({
+        uri,
+        version,
+        lineCount: text.split('\n').length,
+        getText() { return text; },
+        lineAt(line) {
+            const value = text.split('\n')[line];
+            return { text: value, range: { end: { character: value.length } } };
+        },
+    });
+    const branchUri = getDiffDocumentUri(
+        { kind: 'git', ref: commitId },
+        'src/main.rs',
+        'modified',
+        reviewId,
+        workspace
+    );
+    const realUri = vscode.Uri.file(path.join(workspace, 'src/main.rs'));
+    let realDocument = textDocument(realUri);
+    const opened = [];
+    vscode.workspace.openTextDocument = async uri => {
+        opened.push(uri.toString());
+        return realDocument;
+    };
+    const commandCalls = [];
+    const definition = { uri: vscode.Uri.file(path.join(workspace, 'src/lib.rs')) };
+    vscode.commands.executeCommand = async (...args) => {
+        commandCalls.push(args);
+        return [definition];
+    };
+    const context = { subscriptions: [] };
+    registerVirtualDocLanguageFeatures(context, {
+        async isLinkedWorktreeRoot(root) { return root === workspace; },
+    });
+    const providers = vscode.__registeredLanguageProviders;
+    assert.equal(providers.definitions.length, 1);
+    assert.equal(providers.typeDefinitions.length, 1);
+    assert.equal(providers.implementations.length, 1);
+    assert.equal(providers.references.length, 1);
+    assert.equal(providers.hovers.length, 1);
+    assert.deepEqual(providers.definitions[0].selector, { scheme: 'git-local-review' });
+
+    const token = { isCancellationRequested: false };
+    const position = new vscode.Position(1, 22);
+    const virtualDocument = textDocument(branchUri);
+    const result = await providers.definitions[0].provider.provideDefinition(
+        virtualDocument,
+        position,
+        token
+    );
+    assert.deepEqual(result, [definition]);
+    assert.deepEqual(opened, [realUri.toString()]);
+    assert.equal(commandCalls.length, 1);
+    assert.equal(commandCalls[0][0], 'vscode.executeDefinitionProvider');
+    assert.equal(commandCalls[0][1].toString(), realUri.toString());
+    assert.equal(commandCalls[0][2], position);
+
+    commandCalls.length = 0;
+    realDocument = textDocument(realUri, `${sourceText}// dirty\n`);
+    assert.equal(await providers.definitions[0].provider.provideDefinition(
+        virtualDocument,
+        position,
+        token
+    ), undefined);
+    assert.equal(commandCalls.length, 0, 'mismatched snapshots never reach the real provider');
+
+    const originalUri = getDiffDocumentUri(
+        { kind: 'git', ref: commitId },
+        'src/main.rs',
+        'original',
+        reviewId,
+        workspace
+    );
+    realDocument = textDocument(realUri);
+    assert.equal(await providers.definitions[0].provider.provideDefinition(
+        textDocument(originalUri),
+        position,
+        token
+    ), undefined);
+
+    const worktreeUri = getDiffDocumentUri({
+        kind: 'worktree',
+        reviewId,
+        headCommit: commitId,
+        planId: '99999999-9999-4999-8999-999999999999',
+        worktreeRoot: workspace,
+    }, 'src/main.rs', 'modified', reviewId);
+    assert.deepEqual(await providers.definitions[0].provider.provideDefinition(
+        textDocument(worktreeUri),
+        position,
+        token
+    ), [definition]);
+
+    vscode.commands.executeCommand = async () => {
+        realDocument.version++;
+        return [definition];
+    };
+    assert.equal(await providers.definitions[0].provider.provideDefinition(
+        virtualDocument,
+        position,
+        token
+    ), undefined, 'a real-document change invalidates an in-flight result');
+});
+
 test('same-HEAD worktree comments remain attached after a document-cache refresh', async () => {
     const workspace = temporaryDirectory('offline-review-worktree-comments-');
     installVscodeMock(workspace);
@@ -1147,8 +1261,31 @@ test('comment mutations stay UUID-owned while historical placement stays diagnos
     controller.addReply(ownedThread, 'reply in A');
     const editingComment = ownedThread.comments[0];
     editingComment.mode = vscode.CommentMode.Editing;
+    // Host updates the comment body in place before invoking save.
+    editingComment.body = 'edited in A';
     ownedThread.comments = [...ownedThread.comments];
-    controller.saveEditedComment(ownedThread, editingComment, 'edited in A');
+    controller.saveEditedComment(
+        ownedThread,
+        editingComment,
+        typeof editingComment.body === 'string'
+            ? editingComment.body
+            : editingComment.body.value
+    );
+    assert.equal(ownedThread.comments[0].mode, vscode.CommentMode.Preview);
+
+    // Discard restores the last stored body and leaves Preview mode.
+    const draft = ownedThread.comments[0];
+    draft.mode = vscode.CommentMode.Editing;
+    draft.body = 'discard me';
+    controller.discardCommentEdits(ownedThread);
+    assert.equal(ownedThread.comments[0].mode, vscode.CommentMode.Preview);
+    assert.equal(
+        typeof ownedThread.comments[0].body === 'string'
+            ? ownedThread.comments[0].body
+            : ownedThread.comments[0].body.value,
+        'edited in A'
+    );
+
     controller.resolveThread(ownedThread);
     controller.deleteComment(ownedThread, ownedThread.comments[1]);
     commentsA = storage.loadCommentsForReview(reviewA.id);
@@ -1237,4 +1374,74 @@ test('comment mutations stay UUID-owned while historical placement stays diagnos
     provider.dispose();
     controller.dispose();
     manager.dispose();
+});
+
+test('save/cancel command args distinguish reply box from in-place edit', () => {
+    const { isCommentReply, commentBodyText } = built('extension');
+    const reply = {
+        thread: { comments: [] },
+        text: 'new reply body',
+    };
+    // Host unmarshals comments/comment/context to the Comment itself, with
+    // body already rewritten to the editor text (not a CommentReply).
+    const editingComment = {
+        body: 'edited body',
+        mode: vscode.CommentMode.Editing,
+        author: { name: 'tester' },
+        __offlineReviewId: 'review-1',
+        __offlineThreadId: 'thread-1',
+        __offlineCommentId: 'comment-1',
+    };
+    const markdownComment = {
+        body: new vscode.MarkdownString('markdown body'),
+        mode: vscode.CommentMode.Preview,
+        author: { name: 'tester' },
+    };
+
+    assert.equal(isCommentReply(reply), true);
+    assert.equal(isCommentReply(editingComment), false);
+    assert.equal(isCommentReply(markdownComment), false);
+    assert.equal(isCommentReply(undefined), false);
+    assert.equal(commentBodyText(editingComment), 'edited body');
+    assert.equal(commentBodyText(markdownComment), 'markdown body');
+});
+
+test('package contributes distinct thread vs in-place edit comment menus', () => {
+    const packageJson = JSON.parse(
+        fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')
+    );
+    const menus = packageJson.contributes.menus;
+    const threadContext = menus['comments/commentThread/context'];
+    const commentContext = menus['comments/comment/context'];
+
+    const reviewThread = threadContext.filter(entry =>
+        entry.when.includes('commentController == localPrReview')
+    );
+    assert.equal(
+        reviewThread.some(entry =>
+            entry.command === 'localPrReview.addComment'
+            && entry.when.includes('commentThreadIsEmpty')
+        ),
+        true
+    );
+    assert.equal(
+        reviewThread.some(entry =>
+            entry.command === 'localPrReview.replyComment'
+            && entry.when.includes('!commentThreadIsEmpty')
+        ),
+        true
+    );
+    assert.equal(
+        reviewThread.some(entry => entry.command === 'localPrReview.saveComment'),
+        false,
+        'Save must not appear on the new-comment / reply form'
+    );
+    assert.equal(
+        commentContext.some(entry =>
+            entry.command === 'localPrReview.saveComment'
+            && entry.when.includes('localPrReview')
+        ),
+        true,
+        'Save must appear on the in-place edit form'
+    );
 });

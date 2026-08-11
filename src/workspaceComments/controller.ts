@@ -18,6 +18,12 @@ interface CommentWithParent extends vscode.Comment {
     thread?: vscode.CommentThread;
 }
 
+/** Stable ids mirrored onto the comment for hosts that re-wrap objects. */
+interface IdentifiedComment extends vscode.Comment {
+    __offlineThreadId?: string;
+    __offlineCommentId?: string;
+}
+
 export class WorkspaceCommentController {
     private readonly controller: vscode.CommentController;
     private readonly commentingRangeProvider: vscode.CommentingRangeProvider;
@@ -143,6 +149,11 @@ export class WorkspaceCommentController {
         this.refreshThreadComments(thread, threadId);
     }
 
+    /** Reload thread comments from storage, discarding in-progress edit UI state. */
+    discardCommentEdits(thread: vscode.CommentThread): void {
+        this.refreshThreadComments(thread, this.requireThreadId(thread));
+    }
+
     deleteComment(thread: vscode.CommentThread, comment: vscode.Comment): void {
         const managed = thread as ManagedThread;
         const threadId = this.requireThreadId(thread);
@@ -161,8 +172,20 @@ export class WorkspaceCommentController {
         if (withParent.parent || withParent.thread) {
             return withParent.parent ?? withParent.thread;
         }
-        const identity = this.commentIdentities.get(comment);
-        return identity ? this.threads.get(identity.threadId) : undefined;
+        const fromMap = this.commentIdentities.get(comment);
+        if (fromMap) {
+            return this.threads.get(fromMap.threadId);
+        }
+        const tagged = comment as IdentifiedComment;
+        if (tagged.__offlineThreadId) {
+            return this.threads.get(tagged.__offlineThreadId);
+        }
+        for (const thread of this.threads.values()) {
+            if (thread.comments.includes(comment)) {
+                return thread;
+            }
+        }
+        return undefined;
     }
 
     dispose(): void {
@@ -248,11 +271,29 @@ export class WorkspaceCommentController {
     }
 
     private requireCommentIdentity(comment: vscode.Comment, threadId: string): CommentIdentity {
-        const identity = this.commentIdentities.get(comment);
-        if (!identity || identity.threadId !== threadId) {
+        const identity = this.resolveCommentIdentity(comment, threadId);
+        if (!identity) {
             throw new Error('Workspace comment is stale or unmanaged');
         }
         return identity;
+    }
+
+    private resolveCommentIdentity(
+        comment: vscode.Comment,
+        threadId: string
+    ): CommentIdentity | undefined {
+        const fromMap = this.commentIdentities.get(comment);
+        if (fromMap && fromMap.threadId === threadId) {
+            return fromMap;
+        }
+        const tagged = comment as IdentifiedComment;
+        if (tagged.__offlineCommentId && tagged.__offlineThreadId === threadId) {
+            return {
+                threadId: tagged.__offlineThreadId,
+                commentId: tagged.__offlineCommentId,
+            };
+        }
+        return undefined;
     }
 
     private toVscodeComments(thread: WorkspaceCommentThread): vscode.Comment[] {
@@ -260,14 +301,17 @@ export class WorkspaceCommentController {
     }
 
     private toVscodeComment(threadId: string, comment: WorkspaceComment): vscode.Comment {
-        const rendered: vscode.Comment = {
+        const identity: CommentIdentity = { threadId, commentId: comment.id };
+        const rendered: IdentifiedComment = {
             body: new vscode.MarkdownString(comment.body),
             author: { name: comment.author },
             mode: vscode.CommentMode.Preview,
             contextValue: 'canEdit',
             timestamp: new Date(comment.timestamp),
+            __offlineThreadId: threadId,
+            __offlineCommentId: comment.id,
         };
-        this.commentIdentities.set(rendered, { threadId, commentId: comment.id });
+        this.commentIdentities.set(rendered, identity);
         return rendered;
     }
 }

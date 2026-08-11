@@ -2,128 +2,122 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Daedie-git/offline-review/blob/HEAD/LICENSE)
 
-A VS Code extension for local branch diff review and ordinary-workspace code annotation with offline inline comments. Review or annotate code before pushing — no GitHub/remote needed.
+Local code review and annotation for VS Code — no GitHub, no remote PR, no network.
+
+Use **Offline Review** to inspect branch diffs and uncommitted work, leave inline comments that stay on disk, and annotate ordinary workspace files even when no review is open. Pair it with Copilot or other agents via `#offlineReviewComments` and `#offlineCodeComments`.
 
 > [!NOTE]
-> This project is a fork of [Gururagavendra/vscode-local-pr-reviewer](https://github.com/Gururagavendra/vscode-local-pr-reviewer). It preserves the original MIT license and copyright while publishing the fork's changes independently as `Daedie.offline-review`. GitHub hosts this fork as an independent repository rather than as a member of the upstream fork network.
-
-## Demo
-
-![Offline Review in action](https://github.com/Daedie-git/offline-review/raw/HEAD/resources/screenshots/demo.gif)
+> This project is a fork of [Gururagavendra/vscode-local-pr-reviewer](https://github.com/Gururagavendra/vscode-local-pr-reviewer). It preserves the original MIT license and copyright while publishing independently as `Daedie.offline-review`.
 
 ## Installation
 
-### Quick Install
+### Marketplace
 
-1. Open VS Code
-2. Open the Extensions panel (`Ctrl+Shift+X` / `Cmd+Shift+X`)
-3. Search **"Offline Review"**
-4. Click **Install**
+1. Open the Extensions panel (`Ctrl+Shift+X` / `Cmd+Shift+X`)
+2. Search **Offline Review**
+3. Click **Install**
 
-### Via Command Palette
+Or from the Command Palette (`Ctrl+P` / `Cmd+P`):
 
-Press `Ctrl+P` (or `Cmd+P` on Mac) and run:
 ```
 ext install Daedie.offline-review
 ```
 
-### Via Marketplace
+[VS Code Marketplace →](https://marketplace.visualstudio.com/items?itemName=Daedie.offline-review)
 
-Install directly from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Daedie.offline-review)
+### From a VSIX
 
-### From a VSIX File
+1. Download the latest `.vsix` from [GitHub Releases](https://github.com/Daedie-git/offline-review/releases)
+2. Extensions → `...` → **Install from VSIX...**
 
-1. Download the latest `.vsix` from the [GitHub Releases](https://github.com/Daedie-git/offline-review/releases)
-2. Open VS Code → Extensions → `...` menu → **Install from VSIX...**
-3. Select the downloaded file
+## What you get
 
-## Features
+### Diff review (sidebar)
 
-- **Linked Worktree Review** - Select any linked Git worktree without changing the open VS Code workspace
-- **Two Review Modes** - Review the selected worktree's uncommitted changes or its active branch against a base
-- **Branch Diff View** - Select a base branch and see all changed files on the active branch
-- **Inline Comments** - Comment on modified lines and on the original side of deleted files
-- **Resolve/Unresolve** - Toggle comment threads as resolved with a single click
-- **Clean Working Diff** - Extension-owned `.vscode/offline-reviews/` data is excluded from review results
-- **Tree Grouping** - Files grouped by directory with file count
-- **Reviewed Checkbox** - Track which files you've reviewed
-- **Comment Count Badge** - See comment count per file at a glance
-- **Multi-diff Editor** - Open all changed files in one tabbed diff view
-- **Suggest a Change** - Propose inline code changes with a live diff preview
-- **Commits Section** - View commits between base and compare branches
-- **Open File** - Quick action to open the working copy from the diff view
-- **Multiple Reviews** - Save and switch between review sessions
-- **Workspace Code Comments** - Add persistent comments in ordinary editors without creating or activating a review
-- **Safe Re-anchoring** - Workspace, uncommitted, and branch-review comments follow uniquely moved exact source anchors without fuzzy guesses
-- **Copilot Integration** - Query diff comments with `#offlineReviewComments` and workspace comments with `#offlineCodeComments`
-- **Independent Storage** - Reviews keep UUID-backed v2 buckets; workspace comments use one separate v1 file under `.vscode/offline-reviews/`
+Open the **Offline Review** activity-bar icon. The sidebar has five panels:
 
-## Performance
+| Panel | Purpose |
+|---|---|
+| **Branch Selector** | Pick a linked Git worktree, choose **Uncommitted** or **Active branch**, and set the base branch |
+| **Changed Files** | Directory-grouped file tree with reviewed checkboxes, comment badges, commits list, and open-all-diffs |
+| **Reviews** | Saved review sessions — create, activate, switch, or delete |
+| **Review Comments** | All comments for the active review, grouped by file |
+| **Code Comments** | Workspace editor comments (independent of any review) |
 
-Offline Review comments are stored offline, making Copilot queries **36x faster** than fetching from GitHub API:
+### Two review modes
 
-![Time Comparison: Remote API vs Local Storage](https://github.com/Daedie-git/offline-review/raw/HEAD/resources/graphs/time-comparison.png)
+- **Uncommitted** — diff the selected worktree’s `HEAD` against the working tree
+- **Active branch** — diff that worktree’s checked-out branch against the base you choose
 
-## Getting Started
+Worktree selection is session-only: the extension never switches your VS Code workspace. The open folder is labeled **Local** and is the default. Review metadata and comments always live under the original workspace’s `.vscode/offline-reviews/`.
 
-1. Open a Git repository in VS Code
-2. Click the **Offline Review** icon in the activity bar
-3. Choose a linked **Git worktree** (the workspace checkout is **Local** and is selected by default on every activation)
-4. Choose **Uncommitted** for that worktree's `HEAD` vs files, or **Active branch** for its checked-out branch vs the selected base
-5. Browse changed files, open diffs, and add comments
+### Inline review comments
 
-Worktree selection is session-only: Offline Review never switches or opens a VS Code workspace and does not persist the selection. Review metadata and comments remain centralized under the original workspace's `.vscode/offline-reviews/` directory.
+- Comment on changed lines in the multi-diff / side-by-side diff editor
+- Reply, edit, delete, resolve, and unresolve threads
+- **Suggest a Change** with a live preview of the proposed edit
+- Open the working-tree file from the changed-files list
+- Extension-owned storage under `.vscode/offline-reviews/` is excluded from review diffs
 
 ### Workspace code comments
 
-Open a regular file in the original Git workspace, select a line or range, and use the editor gutter's comment action. These threads appear in **Offline Review → Code Comments** even when no review is active. Linked-worktree files, virtual documents, files outside the workspace, symlink escapes, and `.vscode/offline-reviews/` storage files are intentionally rejected.
+Annotate ordinary files in the open workspace **without** creating a review:
 
-Workspace threads are stored in `.vscode/offline-reviews/workspace-comments.json` (schema v1), independently from review comments in `.vscode/offline-reviews/reviews/<review UUID>/comments.json` (schema v2). **Clear Workspace Comments** affects only the workspace file; clearing or deleting reviews never affects it. Missing files remain listed.
+1. Open a regular file
+2. Select a line or range
+3. Use the editor gutter comment action
 
-All three comment modes use the same conservative re-anchoring rule. If the authored text still matches its original range, the thread stays there. Otherwise, one exact line-sequence match in the same file and review side is shown as re-anchored at its effective range. Zero matches are stale, and multiple matches are ambiguous; the extension never chooses a nearest or fuzzy match and does not automatically follow file renames. Authored paths, targets, and ranges remain persisted unchanged while effective placements are computed read-only for the current workspace or review plan.
+Threads show up under **Code Comments**. They are stored separately from review buckets and are not cleared when you delete reviews. Linked-worktree paths, virtual documents, paths outside the workspace, and storage files themselves are rejected on purpose.
 
-Use `#offlineCodeComments` to retrieve structured workspace threads with authored/effective ranges, exact anchors, and missing/stale/ambiguous status. `#offlineReviewComments` reports the equivalent current-plan status for branch and uncommitted review threads. A separate `address-code-comments` agent skill can be installed under `~/.agents/skills/address-code-comments/`; it lists unresolved threads and safely appends replies/resolves successfully addressed thread UUIDs without touching review buckets. The skill is intentionally installed outside this extension repository and is not included in the VSIX.
+### Safe re-anchoring
 
-## Architecture
+Review and workspace comments use the same conservative rule:
+
+- If the original source still matches its authored range, the thread stays put
+- If the exact line sequence moved once in the same file (and same review side), the thread is shown at the new range
+- Zero matches → stale; multiple matches → ambiguous
+- No fuzzy “nearest line” guesses, and no automatic rename following
+
+Authored paths and ranges stay on disk; effective placement is computed for the current plan.
+
+### Agents and Copilot
+
+| Tool reference | What it returns |
+|---|---|
+| `#offlineReviewComments` | Active review / diff threads (optional file + resolved filters) |
+| `#offlineCodeComments` | Workspace code-comment threads with path, anchors, and stale/missing status |
+
+Both are local language-model tools — they do not call GitHub or any remote API.
+
+## Getting started
+
+1. Open a Git repository folder in VS Code
+2. Click the **Offline Review** icon in the activity bar
+3. In **Branch Selector**, confirm the worktree (**Local** is the open folder)
+4. Choose **Uncommitted** or **Active branch** (set a base for branch mode)
+5. Browse **Changed Files**, open diffs, and leave comments
+
+### Multiple reviews
+
+Each mode/worktree combination can become a saved session under **Reviews**. Activate one to restore its branches, files, and comment bucket. Clear or delete reviews without touching **Code Comments**.
+
+## Storage
+
+Everything is offline under the workspace:
 
 ```
-User
- ├── Activity Bar (Offline Review sidebar)
- │    ├── Branch Selector  — pick a linked worktree, review mode, and base branch
- │    ├── Changed Files    — grouped by directory, reviewed checkbox, comment badge
- │    ├── Review Comments  — persisted review comment buckets
- │    ├── Code Comments    — ordinary-editor threads grouped by file
- │    └── Saved Reviews    — switch between review sessions
- │
- ├── Diff Editor           — review comments via VS Code Comment API
- └── Regular Editor        — workspace code comments via a separate controller
-
-Copilot Chat
- ├── #offlineReviewComments  — query review/diff comments
- └── #offlineCodeComments    — query independent workspace comments
-
-Core Services
- ├── GitService       — linked worktree selection, branch list, file diffs, commit log
- ├── CommentController — create, edit, delete, resolve threads
- ├── LocalPrManager   — review CRUD, reviewed-file state
- └── StorageService   — read/write UUID-isolated JSON under .vscode/offline-reviews/
+.vscode/offline-reviews/
+├── reviews/
+│   └── <review-uuid>/
+│       └── comments.json    # review/diff comments (schema v2)
+└── workspace-comments.json  # ordinary-editor comments (schema v1)
 ```
 
-### Key modules
+## Performance
 
-| Module | Path | Responsibility |
-|---|---|---|
-| `extension.ts` | `src/` | Entry point — registers all views, commands, and event handlers |
-| `GitService` | `src/git/` | Wraps VS Code Git API + `child_process` for diff, branch list, commits |
-| `CommentController` | `src/comments/` | Manages all inline comment threads via the VS Code Comment API |
-| `LocalPrManager` | `src/services/` | Review CRUD — create, load, save, delete, reviewed-file state |
-| `StorageService` | `src/storage/` | Reads and writes UUID-isolated review JSON under `.vscode/offline-reviews/` |
-| `BranchSelectorWebviewProvider` | `src/views/` | WebviewView panel for branch selection |
-| `ChangedFilesProvider` | `src/views/` | TreeView — directories + files with badges, checkboxes, open-file action |
-| `LocalCommentsProvider` | `src/views/` | TreeView — flat list of all comment threads and replies |
-| `LocalPrsProvider` | `src/views/` | TreeView — saved review sessions |
-| `LocalReviewTool` | `src/tools/` | Copilot LM Tool — exposes review comments to `#offlineReviewComments` |
-| Workspace comments modules | `src/workspaceComments/` | Safe paths, atomic v1 storage, ordinary-editor controller/view, and `#offlineCodeComments` |
+Comments are read from local disk, so agent queries stay local instead of round-tripping a remote PR API:
+
+![Time comparison: remote API vs local storage](https://github.com/Daedie-git/offline-review/raw/HEAD/resources/graphs/time-comparison.png)
 
 ## Development
 
@@ -132,4 +126,4 @@ npm ci
 npm run check
 ```
 
-`npm run check` type-checks and lints the canonical TypeScript, performs a clean rebuild of `out/`, and runs the integration tests. Generated JavaScript, declarations, and source maps should only be updated through the build.
+`npm run check` type-checks, lints, clean-builds `out/`, and runs tests. Prefer regenerating `out/` through the build rather than hand-editing generated files.

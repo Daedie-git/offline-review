@@ -33,10 +33,13 @@ export declare class ReviewCommentController {
     private applyThreadState;
     private toVscodeComments;
     private toVscodeComment;
+    private resolveCommentIdentity;
     resolveThread(thread: vscode.CommentThread): void;
     unresolveThread(thread: vscode.CommentThread): void;
     addReply(thread: vscode.CommentThread, text: string): void;
     saveEditedComment(thread: vscode.CommentThread, comment: vscode.Comment, newBody: string): void;
+    /** Reload thread comments from storage, discarding in-progress edit UI state. */
+    discardCommentEdits(thread: vscode.CommentThread): void;
     deleteComment(thread: vscode.CommentThread, comment: vscode.Comment): void;
     private disposeThread;
     findThreadForComment(comment: vscode.Comment): vscode.CommentThread | undefined;
