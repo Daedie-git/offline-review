@@ -15,6 +15,7 @@ export declare class ReviewCommentController {
     private activePlan;
     constructor(storageService: StorageService, anchorResolver?: ReviewAnchorResolver | undefined, authorIdentity?: AuthorIdentity);
     setReviewableFiles(filePaths: readonly string[], originalSideFilePaths?: readonly string[]): void;
+    pickFileComment(uri: vscode.Uri): Promise<vscode.CommentThread | undefined>;
     private currentTargetUri;
     /** Load one file's threads only on its exact reviewable diff side. */
     loadThreadsForFile(targetUri: vscode.Uri, filePath: string, plan?: DiffPlan | undefined): void;

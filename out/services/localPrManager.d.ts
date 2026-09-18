@@ -4,6 +4,8 @@ import { GitService } from '../git/gitService';
 export declare class LocalPrManager {
     private readonly gitService;
     private registry;
+    /** The persisted active pointer is a startup default, not another window's authority. */
+    private activeReviewId;
     private readonly storageDir;
     private readonly reviewsDir;
     private readonly registryPath;
@@ -14,6 +16,7 @@ export declare class LocalPrManager {
     readonly onDidChange: vscode.Event<void>;
     constructor(gitService: GitService, workspaceRoot: string);
     private loadRegistry;
+    private mutateRegistry;
     private saveRegistry;
     createBranchReview(baseBranch: string, targetBranch: string, activate?: boolean): Promise<BranchReview>;
     createUncommittedReview(branch: string, activate?: boolean): Promise<UncommittedReview>;
@@ -34,8 +37,7 @@ export declare class LocalPrManager {
     deleteReview(id: string): void;
     clearActiveReview(): boolean;
     clearAllReviews(): void;
-    setActiveReview(id: string): void;
-    private activateReview;
+    setActiveReview(id: string): boolean;
     getActiveReview(): LocalPr | undefined;
     /** Clear only the active pointer; saved reviews and comments remain intact. */
     deactivateReview(): boolean;

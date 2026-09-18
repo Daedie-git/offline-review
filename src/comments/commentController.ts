@@ -103,6 +103,36 @@ export class ReviewCommentController {
         }
     }
 
+    async pickFileComment(uri: vscode.Uri): Promise<vscode.CommentThread | undefined> {
+        const candidates = [...this.threads.entries()]
+            .filter(([, thread]) => thread.uri.toString() === uri.toString() && thread.range)
+            .sort(([, left], [, right]) => left.range!.start.line - right.range!.start.line)
+            .map(([key, thread]) => {
+                const body = thread.comments[0]?.body;
+                return {
+                    label: (typeof body === 'string' ? body : body?.value ?? '')
+                        .replace(/\s+/g, ' ').trim() || 'Comment',
+                    description: `Line ${thread.range!.start.line + 1} - ${
+                        thread.state === vscode.CommentThreadState.Resolved ? 'resolved' : 'unresolved'
+                    }`,
+                    key,
+                    thread,
+                };
+            });
+        if (candidates.length === 0) {
+            vscode.window.showInformationMessage('No review comments anchored in this file.');
+            return undefined;
+        }
+        const selected = await vscode.window.showQuickPick(candidates, {
+            placeHolder: 'Jump to a comment in this file',
+            matchOnDescription: true,
+        });
+        // A refresh or review deletion can replace the threads while the picker is open.
+        return selected && this.threads.get(selected.key) === selected.thread
+            ? selected.thread
+            : undefined;
+    }
+
     private currentTargetUri(plan: DiffPlan, filePath: string): vscode.Uri {
         const original = this.originalSideFiles.has(filePath);
         return getDiffDocumentUri(

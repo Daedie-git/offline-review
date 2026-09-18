@@ -560,8 +560,8 @@ class GitService {
             ], DEFAULT_GIT_TIMEOUT, plan.worktreeRoot);
         // Review metadata is implementation state, never user-authored review
         // content—even when the host repository does not ignore these paths.
-        const files = parseNameStatus(output).filter(change => !isReviewStoragePath(change.filePath)
-            && (!change.oldFilePath || !isReviewStoragePath(change.oldFilePath)));
+        const files = parseNameStatus(output).filter(change => !this.isReviewStoragePath(change.filePath, plan.worktreeRoot)
+            && (!change.oldFilePath || !this.isReviewStoragePath(change.oldFilePath, plan.worktreeRoot)));
         if (plan.kind === 'worktree') {
             const untrackedOutput = await this.execGit([
                 'ls-files',
@@ -572,13 +572,22 @@ class GitService {
             ], DEFAULT_GIT_TIMEOUT, plan.worktreeRoot);
             const seen = new Set(files.map(file => file.filePath));
             for (const filePath of splitNul(untrackedOutput)) {
-                if (!isReviewStoragePath(filePath) && !seen.has(filePath)) {
+                if (!this.isReviewStoragePath(filePath, plan.worktreeRoot) && !seen.has(filePath)) {
                     files.push({ status: 'added', filePath });
                     seen.add(filePath);
                 }
             }
         }
         return files;
+    }
+    isReviewStoragePath(filePath, worktreeRoot) {
+        if (isReviewStoragePath(filePath)) {
+            return true;
+        }
+        const storagePath = path.relative(this.localWorktreeRoot, path.join(this.localWorkspaceRoot, '.vscode', 'offline-reviews'));
+        const storageRoot = path.resolve(worktreeRoot, storagePath);
+        const absolutePath = path.resolve(worktreeRoot, filePath);
+        return isPathInside(storageRoot, absolutePath, true);
     }
     getFileUri(ref, filePath, side) {
         assertFullObjectId(ref, 'document ref');

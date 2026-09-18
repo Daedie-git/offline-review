@@ -47,6 +47,9 @@ export declare class ChangedFilesProvider implements vscode.TreeDataProvider<Cha
     getAllExpandableItems(): ChangedFileTreeItem[];
     getAllFileItems(): FileChangeItem[];
     getAllFilePaths(): string[];
+    /** Navigation may rebind an old tab, but never across review/worktree owners. */
+    getFileItemForUri(uri: vscode.Uri): FileChangeItem | undefined;
+    clearReviewProgress(): void;
     clear(): void;
     fireChange(): void;
     dispose(): void;

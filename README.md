@@ -53,6 +53,8 @@ Worktree selection is session-only: the extension never switches your VS Code wo
 
 ### Inline review comments
 
+- Use **Go to Comment in File** (the comment icon in Changed Files or the diff editor toolbar) to search and jump to an existing thread by line, text, or resolved state.
+- Deleting a review removes its comments and reviewed checkmarks but keeps the selected comparison visible. Refresh Changed Files still works; choose a review mode to start a new review.
 - Comment on changed lines in the multi-diff / side-by-side diff editor
 - Reply, edit, delete, resolve, and unresolve threads
 - **Suggest a Change** with a live preview of the proposed edit
@@ -112,6 +114,8 @@ Everything is offline under the workspace:
 │       └── comments.json    # review/diff comments (schema v2)
 └── workspace-comments.json  # ordinary-editor comments (schema v1)
 ```
+
+Storage supports Windows, macOS, and Linux. Workspace-comment writes use a cooperating lock, synced temporary files, and recoverable publication. Linux additionally uses descriptor-relative paths to resist concurrent directory replacement. Other platforms validate canonical directory identities before and after I/O, but cannot provide the same race-free traversal guarantee through Node's filesystem API. On Windows, directory handles cannot be flushed; file contents are synced, but directory-entry durability across sudden power loss is not guaranteed. Windows file access follows the workspace's ACLs rather than POSIX permission bits.
 
 ## Performance
 

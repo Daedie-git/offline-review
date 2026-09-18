@@ -39,6 +39,7 @@ const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const crypto = __importStar(require("crypto"));
 const types_1 = require("../types");
+const fileLock_1 = require("../workspaceComments/fileLock");
 const EMPTY_REGISTRY = () => ({
     version: 2,
     reviews: [],
@@ -57,9 +58,11 @@ class LocalPrManager {
         this.reviewsDir = path.join(this.storageDir, 'reviews');
         this.registryPath = path.join(this.storageDir, 'registry.json');
         this.loadRegistry();
+        this.activeReviewId = this.registry.activeReviewId;
     }
-    loadRegistry() {
+    loadRegistry(strict = false) {
         if (!fs.existsSync(this.registryPath)) {
+            this.registry = EMPTY_REGISTRY();
             return;
         }
         try {
@@ -70,12 +73,42 @@ class LocalPrManager {
             this.registry = parsed;
         }
         catch {
+            if (strict) {
+                throw new Error('Review registry is malformed or unreadable; refusing to overwrite it');
+            }
             // Unsupported or malformed registries are ignored. This release
             // accepts only the canonical v2 format.
             this.registry = EMPTY_REGISTRY();
         }
     }
-    saveRegistry(emitChange = true) {
+    mutateRegistry(mutation) {
+        fs.mkdirSync(this.storageDir, { recursive: true });
+        let changed = false;
+        const previousActive = this.activeReviewId;
+        const result = (0, fileLock_1.withFileLock)(path.join(this.storageDir, '.registry.lock'), () => {
+            const previous = this.registry;
+            try {
+                this.loadRegistry(true);
+                const before = JSON.stringify(this.registry);
+                const value = mutation();
+                changed = before !== JSON.stringify(this.registry);
+                if (changed) {
+                    this.saveRegistry();
+                }
+                return value;
+            }
+            catch (error) {
+                this.registry = previous;
+                this.activeReviewId = previousActive;
+                throw error;
+            }
+        });
+        if (changed || previousActive !== this.activeReviewId) {
+            this._onDidChange.fire();
+        }
+        return result;
+    }
+    saveRegistry() {
         fs.mkdirSync(this.storageDir, { recursive: true });
         const tempPath = path.join(this.storageDir, `.registry.${process.pid}.${crypto.randomUUID()}.tmp`);
         let descriptor;
@@ -104,9 +137,6 @@ class LocalPrManager {
             }
             throw error;
         }
-        if (emitChange) {
-            this._onDidChange.fire();
-        }
     }
     async createBranchReview(baseBranch, targetBranch, activate = true) {
         const review = await this.createReviewInternal(baseBranch, targetBranch, 'branch', activate);
@@ -132,10 +162,11 @@ class LocalPrManager {
         if (mode === 'uncommitted' && sourceBranch !== targetBranch) {
             throw new Error('An uncommitted review must use one branch');
         }
+        this.loadRegistry(true);
         const existing = this.findReviewByIdentity(sourceBranch, targetBranch, mode);
         if (existing) {
             if (activate) {
-                this.activateReview(existing);
+                this.setActiveReview(existing.id);
             }
             return existing;
         }
@@ -155,7 +186,7 @@ class LocalPrManager {
             }
         }
         if (activate) {
-            this.activateReview(review);
+            this.setActiveReview(review.id);
         }
         return review;
     }
@@ -190,13 +221,14 @@ class LocalPrManager {
         if (creationEpoch !== this.creationEpoch) {
             throw new Error('Review creation was superseded by a clear operation');
         }
-        const existing = this.findReviewByIdentity(sourceBranch, targetBranch, mode);
-        if (existing) {
-            return existing;
-        }
-        this.registry.reviews.push(review);
-        this.saveRegistry();
-        return review;
+        return this.mutateRegistry(() => {
+            const existing = this.findReviewByIdentity(sourceBranch, targetBranch, mode);
+            if (existing) {
+                return existing;
+            }
+            this.registry.reviews.push(review);
+            return review;
+        });
     }
     findReviewByIdentity(sourceBranch, targetBranch, mode) {
         return this.registry.reviews.find(review => mode === 'branch'
@@ -209,21 +241,16 @@ class LocalPrManager {
         return this.registry.preferredBaseBranch;
     }
     setPreferredBaseBranch(branch) {
-        if (!branch || this.registry.preferredBaseBranch === branch) {
+        if (!branch) {
             return;
         }
-        this.registry.preferredBaseBranch = branch;
-        this.saveRegistry();
+        this.mutateRegistry(() => { this.registry.preferredBaseBranch = branch; });
     }
     getActiveMode() {
-        return this.registry.activeMode;
+        return this.getActiveReview()?.mode ?? this.registry.activeMode;
     }
     setActiveMode(mode) {
-        if (this.registry.activeMode === mode) {
-            return;
-        }
-        this.registry.activeMode = mode;
-        this.saveRegistry();
+        this.mutateRegistry(() => { this.registry.activeMode = mode; });
     }
     getReviewMode(review) {
         return review.mode;
@@ -235,39 +262,43 @@ class LocalPrManager {
         return (0, types_1.getReviewSourceTarget)(review);
     }
     updateBranchReviewFallbackCommits(reviewId, sourceCommit, targetCommit) {
-        const review = this.getReviewById(reviewId);
-        if (review?.mode !== 'branch') {
-            return false;
-        }
-        const normalizedSource = sourceCommit.trim();
-        const normalizedTarget = targetCommit.trim();
-        if (review.sourceCommit === normalizedSource && review.targetCommit === normalizedTarget) {
-            return false;
-        }
-        review.sourceCommit = normalizedSource;
-        review.targetCommit = normalizedTarget;
-        this.saveRegistry();
-        return true;
+        return this.mutateRegistry(() => {
+            const review = this.getReviewById(reviewId);
+            if (review?.mode !== 'branch') {
+                return false;
+            }
+            const normalizedSource = sourceCommit.trim();
+            const normalizedTarget = targetCommit.trim();
+            if (review.sourceCommit === normalizedSource && review.targetCommit === normalizedTarget) {
+                return false;
+            }
+            review.sourceCommit = normalizedSource;
+            review.targetCommit = normalizedTarget;
+            return true;
+        });
     }
     invalidatePendingCreations() {
         this.creationEpoch++;
         this.pendingReviewCreations.clear();
     }
     deleteReview(id) {
-        const review = this.getReviewById(id);
-        if (!review) {
-            return;
-        }
-        const deletingActive = this.registry.activeReviewId === id;
-        if (deletingActive) {
+        if (this.activeReviewId === id) {
             this.invalidatePendingCreations();
         }
-        fs.rmSync(this.getReviewDir(review), { recursive: true, force: true });
-        this.registry.reviews = this.registry.reviews.filter(candidate => candidate.id !== id);
-        if (deletingActive) {
-            this.registry.activeReviewId = undefined;
-        }
-        this.saveRegistry();
+        this.mutateRegistry(() => {
+            if (this.activeReviewId === id) {
+                this.activeReviewId = undefined;
+            }
+            const review = this.getReviewById(id);
+            if (!review) {
+                return;
+            }
+            fs.rmSync(this.getReviewDir(review), { recursive: true, force: true });
+            this.registry.reviews = this.registry.reviews.filter(candidate => candidate.id !== id);
+            if (this.registry.activeReviewId === id) {
+                this.registry.activeReviewId = undefined;
+            }
+        });
     }
     clearActiveReview() {
         const active = this.getActiveReview();
@@ -279,47 +310,47 @@ class LocalPrManager {
     }
     clearAllReviews() {
         this.invalidatePendingCreations();
-        for (const review of this.registry.reviews) {
-            fs.rmSync(this.getReviewDir(review), { recursive: true, force: true });
-        }
-        this.registry.reviews = [];
-        this.registry.activeReviewId = undefined;
-        this.saveRegistry();
+        this.mutateRegistry(() => {
+            for (const review of this.registry.reviews) {
+                fs.rmSync(this.getReviewDir(review), { recursive: true, force: true });
+            }
+            this.registry.reviews = [];
+            this.registry.activeReviewId = undefined;
+            this.activeReviewId = undefined;
+        });
     }
     setActiveReview(id) {
-        const review = this.getReviewById(id);
-        if (!review) {
-            return;
-        }
-        const changed = this.registry.activeReviewId !== id
-            || this.registry.activeMode !== review.mode
-            || (review.mode === 'branch'
-                && this.registry.preferredBaseBranch !== review.baseBranch);
-        if (changed) {
-            this.activateReview(review);
-        }
-    }
-    activateReview(review) {
-        this.registry.activeReviewId = review.id;
-        this.registry.activeMode = review.mode;
-        if (review.mode === 'branch') {
-            this.registry.preferredBaseBranch = review.baseBranch;
-        }
-        this.saveRegistry();
+        return this.mutateRegistry(() => {
+            const review = this.getReviewById(id);
+            if (!review) {
+                return false;
+            }
+            this.registry.activeReviewId = review.id;
+            this.activeReviewId = review.id;
+            this.registry.activeMode = review.mode;
+            if (review.mode === 'branch') {
+                this.registry.preferredBaseBranch = review.baseBranch;
+            }
+            return true;
+        });
     }
     getActiveReview() {
-        return this.registry.activeReviewId
-            ? this.getReviewById(this.registry.activeReviewId)
+        return this.activeReviewId
+            ? this.getReviewById(this.activeReviewId)
             : undefined;
     }
     /** Clear only the active pointer; saved reviews and comments remain intact. */
     deactivateReview() {
-        if (this.registry.activeReviewId === undefined) {
-            return false;
-        }
-        this.registry.activeReviewId = undefined;
-        this.saveRegistry();
-        return true;
+        const id = this.activeReviewId;
+        this.mutateRegistry(() => {
+            this.activeReviewId = undefined;
+            if (id === undefined || this.registry.activeReviewId !== id) {
+                return false;
+            }
+            this.registry.activeReviewId = undefined;
+            return true;
+        });
+        return id !== undefined;
     }
     listReviews() {
         return [...this.registry.reviews];
@@ -350,11 +381,14 @@ class LocalPrManager {
         return [...(this.getActiveReview()?.reviewedFiles ?? [])];
     }
     setReviewedFiles(files) {
-        const review = this.getActiveReview();
-        if (review) {
-            review.reviewedFiles = [...files];
-            this.saveRegistry();
-        }
+        // Capture the UI's owner before reloading another window's active pointer.
+        const id = this.activeReviewId;
+        this.mutateRegistry(() => {
+            const review = id ? this.getReviewById(id) : undefined;
+            if (review) {
+                review.reviewedFiles = [...files];
+            }
+        });
     }
     dispose() {
         this._onDidChange.dispose();

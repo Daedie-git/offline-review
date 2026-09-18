@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import {
     CommitInfo,
     DiffPlan,
@@ -6,7 +7,7 @@ import {
     LocalPr,
     PreparedDiffState,
 } from '../types';
-import { FileDiffUris, GitService } from '../git/gitService';
+import { FileDiffUris, GitService, parseDiffDocumentUri } from '../git/gitService';
 import { StorageService } from '../storage/storageService';
 import { LocalPrManager } from '../services/localPrManager';
 import { isEffectiveReviewProjection, ReviewAnchorResolver } from '../comments/reviewAnchorResolver';
@@ -63,8 +64,6 @@ export class ChangedFilesProvider implements vscode.TreeDataProvider<ChangedFile
     }
 
     private buildRootSections(): ChangedFileTreeItem[] {
-        this.filesSection = undefined;
-        this.commitsSection = undefined;
         if (!this.plan) {
             return [];
         }
@@ -74,13 +73,13 @@ export class ChangedFilesProvider implements vscode.TreeDataProvider<ChangedFile
                 : [new MessageItem('No changes between these branches', 'The saved target commit matches its merge base.')];
         }
 
-        this.filesSection = new SectionItem(
+        this.filesSection ??= new SectionItem(
             'Files',
             'files',
             this.buildFileTree(),
             this.files.length
         );
-        this.commitsSection = new SectionItem(
+        this.commitsSection ??= new SectionItem(
             'Commits',
             'commits',
             this.buildCommitList(),
@@ -259,6 +258,7 @@ export class ChangedFilesProvider implements vscode.TreeDataProvider<ChangedFile
     }
 
     getAllExpandableItems(): ChangedFileTreeItem[] {
+        this.buildRootSections();
         const items: ChangedFileTreeItem[] = [];
         if (this.filesSection) {
             items.push(this.filesSection);
@@ -275,6 +275,7 @@ export class ChangedFilesProvider implements vscode.TreeDataProvider<ChangedFile
     }
 
     getAllFileItems(): FileChangeItem[] {
+        this.buildRootSections();
         const items: FileChangeItem[] = [];
         if (!this.filesSection) {
             return items;
@@ -291,6 +292,41 @@ export class ChangedFilesProvider implements vscode.TreeDataProvider<ChangedFile
 
     getAllFilePaths(): string[] {
         return this.files.map(file => file.filePath);
+    }
+
+    /** Navigation may rebind an old tab, but never across review/worktree owners. */
+    getFileItemForUri(uri: vscode.Uri): FileChangeItem | undefined {
+        const plan = this.plan;
+        if (!plan) {
+            return undefined;
+        }
+        const items = this.getAllFileItems();
+        const exact = items.find(item => item.leftUri.toString() === uri.toString()
+            || item.rightUri.toString() === uri.toString());
+        if (exact) {
+            return exact;
+        }
+        if (uri.scheme === 'file') {
+            const relative = path.relative(plan.worktreeRoot, uri.fsPath).split(path.sep).join('/');
+            return items.find(item => item.fileChange.filePath === relative);
+        }
+        const parsed = parseDiffDocumentUri(uri);
+        if (!parsed || parsed.reviewId !== plan.reviewId || !parsed.worktreeRoot
+            || path.relative(parsed.worktreeRoot, plan.worktreeRoot) !== '') {
+            return undefined;
+        }
+        return items.find(item => parsed.filePath === (parsed.side === 'original'
+            ? item.fileChange.oldFilePath ?? item.fileChange.filePath
+            : item.fileChange.filePath));
+    }
+
+    clearReviewProgress(): void {
+        this.requestGeneration++;
+        this.reviewedFiles.clear();
+        if (this.preparedState) {
+            this.preparedState = Object.freeze({ ...this.preparedState, reviewedFiles: [] });
+        }
+        this.fireChange();
     }
 
     clear(): void {

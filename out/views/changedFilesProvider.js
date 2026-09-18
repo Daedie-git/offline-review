@@ -35,6 +35,8 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.MessageItem = exports.CommitItem = exports.FileChangeItem = exports.FolderItem = exports.SectionItem = exports.ChangedFilesProvider = void 0;
 const vscode = __importStar(require("vscode"));
+const path = __importStar(require("path"));
+const gitService_1 = require("../git/gitService");
 const reviewAnchorResolver_1 = require("../comments/reviewAnchorResolver");
 class ChangedFilesProvider {
     constructor(gitService, _storageService, localPrManager, anchorResolver) {
@@ -74,8 +76,6 @@ class ChangedFilesProvider {
         return undefined;
     }
     buildRootSections() {
-        this.filesSection = undefined;
-        this.commitsSection = undefined;
         if (!this.plan) {
             return [];
         }
@@ -84,8 +84,8 @@ class ChangedFilesProvider {
                 ? [new MessageItem('No uncommitted changes', 'HEAD and the working tree are identical.')]
                 : [new MessageItem('No changes between these branches', 'The saved target commit matches its merge base.')];
         }
-        this.filesSection = new SectionItem('Files', 'files', this.buildFileTree(), this.files.length);
-        this.commitsSection = new SectionItem('Commits', 'commits', this.buildCommitList(), this.commits.length, vscode.TreeItemCollapsibleState.Collapsed);
+        this.filesSection ?? (this.filesSection = new SectionItem('Files', 'files', this.buildFileTree(), this.files.length));
+        this.commitsSection ?? (this.commitsSection = new SectionItem('Commits', 'commits', this.buildCommitList(), this.commits.length, vscode.TreeItemCollapsibleState.Collapsed));
         return [this.filesSection, this.commitsSection];
     }
     buildFileTree() {
@@ -232,6 +232,7 @@ class ChangedFilesProvider {
         return this.plan;
     }
     getAllExpandableItems() {
+        this.buildRootSections();
         const items = [];
         if (this.filesSection) {
             items.push(this.filesSection);
@@ -247,6 +248,7 @@ class ChangedFilesProvider {
         return items;
     }
     getAllFileItems() {
+        this.buildRootSections();
         const items = [];
         if (!this.filesSection) {
             return items;
@@ -263,6 +265,39 @@ class ChangedFilesProvider {
     }
     getAllFilePaths() {
         return this.files.map(file => file.filePath);
+    }
+    /** Navigation may rebind an old tab, but never across review/worktree owners. */
+    getFileItemForUri(uri) {
+        const plan = this.plan;
+        if (!plan) {
+            return undefined;
+        }
+        const items = this.getAllFileItems();
+        const exact = items.find(item => item.leftUri.toString() === uri.toString()
+            || item.rightUri.toString() === uri.toString());
+        if (exact) {
+            return exact;
+        }
+        if (uri.scheme === 'file') {
+            const relative = path.relative(plan.worktreeRoot, uri.fsPath).split(path.sep).join('/');
+            return items.find(item => item.fileChange.filePath === relative);
+        }
+        const parsed = (0, gitService_1.parseDiffDocumentUri)(uri);
+        if (!parsed || parsed.reviewId !== plan.reviewId || !parsed.worktreeRoot
+            || path.relative(parsed.worktreeRoot, plan.worktreeRoot) !== '') {
+            return undefined;
+        }
+        return items.find(item => parsed.filePath === (parsed.side === 'original'
+            ? item.fileChange.oldFilePath ?? item.fileChange.filePath
+            : item.fileChange.filePath));
+    }
+    clearReviewProgress() {
+        this.requestGeneration++;
+        this.reviewedFiles.clear();
+        if (this.preparedState) {
+            this.preparedState = Object.freeze({ ...this.preparedState, reviewedFiles: [] });
+        }
+        this.fireChange();
     }
     clear() {
         this.requestGeneration++;

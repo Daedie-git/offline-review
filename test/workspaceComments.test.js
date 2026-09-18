@@ -10,7 +10,7 @@ const { installVscodeMock, vscode } = require('./helpers/vscodeMock');
 
 const projectRoot = path.resolve(__dirname, '..');
 const compiledRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-code-comments-build-'));
-execFileSync(path.join(projectRoot, 'node_modules', '.bin', 'tsc'), [
+execFileSync(process.execPath, [require.resolve('typescript/bin/tsc'),
     '-p', projectRoot,
     '--outDir', compiledRoot,
     '--declaration', 'false',
@@ -193,13 +193,25 @@ test('fresh storage children are descriptor-bound and parent-synced before desce
         const name = path.basename(String(directory));
         if (name === '.vscode' || name === 'offline-reviews') {
             events.push(`mkdir:${name}`);
-            assert.match(String(directory), /^\/proc\/self\/fd\/\d+\//);
+            if (process.platform === 'linux') {
+                assert.match(String(directory), /^\/proc\/self\/fd\/\d+\//);
+            } else {
+                assert.equal(String(directory), path.join(workspace,
+                    name === '.vscode' ? '.vscode' : '.vscode/offline-reviews'));
+            }
         }
         return result;
     };
     fs.fsyncSync = descriptor => {
         if (fs.fstatSync(descriptor).isDirectory()) {
-            events.push(`sync:${fs.readlinkSync(`/proc/self/fd/${descriptor}`)}`);
+            const stat = fs.fstatSync(descriptor);
+            const directory = [workspace, path.join(workspace, '.vscode'),
+                path.join(workspace, '.vscode/offline-reviews')].find(candidate => {
+                if (!fs.existsSync(candidate)) return false;
+                const other = fs.statSync(candidate);
+                return other.dev === stat.dev && other.ino === stat.ino;
+            });
+            events.push(`sync:${directory}`);
         }
         return originalFsync(descriptor);
     };
@@ -231,8 +243,9 @@ test('parent fsync preflight failure prevents fresh child publication', () => {
     write(workspace, 'src/sync.ts', 'sync\n');
     const originalFsync = fs.fsyncSync;
     fs.fsyncSync = descriptor => {
-        if (fs.fstatSync(descriptor).isDirectory()
-            && fs.readlinkSync(`/proc/self/fd/${descriptor}`) === workspace) {
+        const stat = fs.fstatSync(descriptor);
+        const parent = fs.statSync(workspace);
+        if (stat.isDirectory() && stat.dev === parent.dev && stat.ino === parent.ino) {
             const error = new Error('injected parent fsync failure');
             error.code = 'EIO';
             throw error;
@@ -279,7 +292,9 @@ test('v1 storage persists atomically, reports stale/missing, and mutates by UUID
     assert.equal(fs.existsSync(storage.filePath), false);
 
     const thread = storage.addThread('src/file.ts', 0, 1, 'first\nsecond', 'fix this', 'tester');
-    assert.equal(fs.statSync(storage.filePath).mode & 0o777, 0o600);
+    if (process.platform !== 'win32') {
+        assert.equal(fs.statSync(storage.filePath).mode & 0o777, 0o600);
+    }
     assert.deepEqual(
         fs.readdirSync(path.dirname(storage.filePath)).filter(name => name.endsWith('.tmp')),
         []
@@ -325,16 +340,17 @@ test('cooperating lock and content fingerprint prevent lost updates', () => {
     fs.unlinkSync(storage.lockPath);
 
     const originalFsync = fs.fsyncSync;
+    const originalOpen = fs.openSync;
+    let temporaryDescriptor;
+    fs.openSync = (filePath, ...args) => {
+        const descriptor = originalOpen(filePath, ...args);
+        if (String(filePath).endsWith('.tmp')) temporaryDescriptor = descriptor;
+        return descriptor;
+    };
     let injected = false;
     fs.fsyncSync = descriptor => {
         originalFsync(descriptor);
-        let descriptorPath = '';
-        try {
-            descriptorPath = fs.readlinkSync(`/proc/self/fd/${descriptor}`);
-        } catch {
-            // The test's mutation hook is Linux-specific, like the bound-path hardening it exercises.
-        }
-        if (!injected && descriptorPath.endsWith('.tmp')) {
+        if (!injected && descriptor === temporaryDescriptor) {
             injected = true;
             const external = JSON.parse(fs.readFileSync(storage.filePath, 'utf8'));
             external.threads[0].comments[0].body = 'external writer';
@@ -348,6 +364,7 @@ test('cooperating lock and content fingerprint prevent lost updates', () => {
         );
     } finally {
         fs.fsyncSync = originalFsync;
+        fs.openSync = originalOpen;
     }
     assert.equal(storage.load().threads[0].comments[0].body, 'external writer');
     assert.equal(storage.load().threads[0].comments.length, 1);
@@ -780,7 +797,9 @@ test('failed first-publication sync recovers from its durable temporary', () => 
     assert.equal(fs.readdirSync(directory).some(name => name.endsWith('.tmp')), false);
 });
 
-test('storage fails closed before mutation when descriptor-bound paths are unavailable', () => {
+test('storage fails closed before mutation when descriptor-bound paths are unavailable', {
+    skip: process.platform !== 'linux' && 'Linux procfs-specific guarantee',
+}, () => {
     const { workspace, storage } = fixture();
     write(workspace, 'src/no-proc.ts', 'bound\n');
     const thread = storage.addThread('src/no-proc.ts', 0, 0, 'bound', 'original', 'tester');
@@ -808,7 +827,32 @@ test('storage fails closed before mutation when descriptor-bound paths are unava
     assert.deepEqual(fs.readdirSync(directory).sort(), originalEntries);
 });
 
-test('directory replacement around sensitive stages never changes the replacement store', () => {
+test('directory identity changes detected before I/O leave the replacement store untouched', () => {
+    const { workspace, storage } = fixture();
+    write(workspace, 'src/identity.ts', 'identity\n');
+    const thread = storage.addThread('src/identity.ts', 0, 0, 'identity', 'original', 'tester');
+    const directory = path.dirname(storage.filePath);
+    const original = fs.readFileSync(storage.filePath);
+    const verify = storage.verifyStorageDirectory.bind(storage);
+    let replaced = false;
+    storage.verifyStorageDirectory = opened => {
+        if (!replaced && opened.path === directory) {
+            replaced = true;
+            fs.renameSync(directory, `${directory}-displaced`);
+            fs.mkdirSync(directory);
+            fs.writeFileSync(storage.filePath, original);
+        }
+        verify(opened);
+    };
+    assert.throws(() => storage.addReply(thread.id, 'must not write', 'tester'), /storage changed unexpectedly/);
+    assert.equal(replaced, true);
+    assert.deepEqual(fs.readFileSync(storage.filePath), original);
+    assert.deepEqual(fs.readdirSync(directory), ['workspace-comments.json']);
+});
+
+test('directory replacement around sensitive stages never changes the replacement store', {
+    skip: process.platform !== 'linux' && 'Requires Linux descriptor-relative filesystem operations',
+}, () => {
     for (const stage of ['lock', 'temporary', 'displacement', 'publication']) {
         const { workspace, storage } = fixture();
         write(workspace, `src/${stage}.ts`, `${stage}\n`);

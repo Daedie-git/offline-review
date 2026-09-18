@@ -86,6 +86,7 @@ export declare class GitService {
     /** Resolve a persisted review into one explicit, immutable diff strategy. */
     prepareDiffPlan(review: LocalPr): Promise<DiffPlan>;
     getChangedFiles(plan: DiffPlan): Promise<FileChange[]>;
+    private isReviewStoragePath;
     getFileUri(ref: string, filePath: string, side?: 'original' | 'modified'): vscode.Uri;
     getWorkingTreeFileUri(plan: WorktreeDiffPlan, filePath: string): vscode.Uri;
     getFileDiffUris(plan: DiffPlan, change: FileChange): FileDiffUris;

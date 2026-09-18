@@ -44,7 +44,7 @@ interface ReviewModeOptions {
     quiet?: boolean;
 }
 
-type ReviewAttempt = 'applied' | 'superseded' | 'failed';
+type ReviewAttempt = 'applied' | 'superseded' | 'failed' | 'pending';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -158,13 +158,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // Register independently so one optional tool cannot disable the other.
     }
 
-    context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider(
-            BranchSelectorWebviewProvider.viewType,
-            branchSelectorProvider
-        )
-    );
-
     const changedFilesTreeView = vscode.window.createTreeView(
         'localPrReview.changedFiles',
         {
@@ -185,6 +178,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
         }),
         changedFilesTreeView,
+        changedFilesTreeView.onDidChangeVisibility(event => {
+            if (event.visible) {
+                changedFilesProvider.fireChange();
+            }
+        }),
         vscode.window.createTreeView('localPrReview.localPrs', {
             treeDataProvider: localPrsProvider,
         }),
@@ -206,11 +204,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Every review switch/refresh runs through this generation. Preparation does
     // not mutate visible state; one synchronous apply publishes only the winner.
     let transitionRetryTimer: ReturnType<typeof setTimeout> | undefined;
+    let comparisonReview: LocalPr | undefined;
     const transitionToReview = async (
         review: LocalPr,
         options: TransitionOptions = {},
         reservedGeneration?: number
-    ): Promise<boolean> => {
+    ): Promise<boolean | 'pending'> => {
         const generation = reservedGeneration ?? transitionCoordinator.beginTransition();
         if (!transitionCoordinator.isCurrent(generation)) {
             return false;
@@ -248,7 +247,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                         void transitionToReview(review, options, generation);
                     }
                 }, 100);
-                return false;
+                return 'pending';
             }
             if (!transitionCoordinator.isCurrent(generation)
                 || !transitionCoordinator.inputsAreCurrent(guarded.snapshot)) {
@@ -263,7 +262,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 || !transitionCoordinator.inputsAreCurrent(guarded.snapshot)) {
                 return false;
             }
-            localPrManager.setActiveReview(review.id);
+            if (!localPrManager.setActiveReview(review.id)) {
+                return false;
+            }
             reviewAnchorResolver.applyPreparedState(preparedComments);
             changedFilesProvider.applyPreparedState(prepared);
             if (prepared.plan.kind === 'branch') {
@@ -273,6 +274,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     prepared.plan.targetCommit
                 );
             }
+            comparisonReview = localPrManager.getReviewById(review.id);
             commentController.setReviewableFiles(
                 prepared.files.map(file => file.filePath),
                 prepared.files
@@ -298,19 +300,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
     };
 
-    const clearReviewUi = async (reservedGeneration?: number): Promise<void> => {
+    const clearReviewUi = async (
+        reservedGeneration?: number,
+        preserveComparison = false
+    ): Promise<void> => {
         const generation = reservedGeneration ?? transitionCoordinator.beginTransition();
         if (!transitionCoordinator.isCurrent(generation)) {
             return;
         }
         localPrManager.deactivateReview();
         reviewAnchorResolver.clear();
-        changedFilesProvider.clear();
+        if (preserveComparison) {
+            changedFilesProvider.clearReviewProgress();
+        } else {
+            comparisonReview = undefined;
+            changedFilesProvider.clear();
+        }
         commentController.setReviewableFiles([]);
         commentController.loadAllThreads();
         localPrsProvider.refresh();
         localCommentsProvider.refresh();
         fileDecorationProvider.refresh();
+        if (preserveComparison) {
+            return;
+        }
         const currentBranch = await gitService.getCurrentBranch();
         if (transitionCoordinator.isCurrent(generation)) {
             branchSelectorProvider.setReviewState({
@@ -362,6 +375,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 { showError: !options.quiet },
                 generation
             );
+            if (applied === 'pending') {
+                return 'pending';
+            }
             if (!applied) {
                 return transitionCoordinator.isCurrent(generation) ? 'failed' : 'superseded';
             }
@@ -457,6 +473,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 { showError: !options.quiet },
                 generation
             );
+            if (applied === 'pending') {
+                return 'pending';
+            }
             if (!applied) {
                 return transitionCoordinator.isCurrent(generation) ? 'failed' : 'superseded';
             }
@@ -832,7 +851,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     const generation = transitionCoordinator.beginTransition();
                     await storageService.withWatchSuppressed(async () => {
                         localPrManager.deleteReview(review.id);
-                        await clearReviewUi(generation);
+                        await clearReviewUi(generation, true);
                     });
                 } else {
                     await storageService.withWatchSuppressed(() => {
@@ -867,7 +886,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const generation = transitionCoordinator.beginTransition();
             await storageService.withWatchSuppressed(async () => {
                 localPrManager.deleteReview(active.id);
-                await clearReviewUi(generation);
+                await clearReviewUi(generation, true);
             });
             vscode.window.showInformationMessage('Active review cleared.');
         }),
@@ -888,7 +907,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const generation = transitionCoordinator.beginTransition();
             await storageService.withWatchSuppressed(async () => {
                 localPrManager.clearAllReviews();
-                await clearReviewUi(generation);
+                await clearReviewUi(generation, true);
             });
             vscode.window.showInformationMessage('All reviews and comments cleared.');
         })
@@ -902,6 +921,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
             const active = localPrManager.getActiveReview();
             if (!active) {
+                if (comparisonReview) {
+                    const generation = transitionCoordinator.beginTransition();
+                    try {
+                        const prepared = await changedFilesProvider.prepareRefresh({
+                            ...comparisonReview, reviewedFiles: [],
+                        });
+                        if (transitionCoordinator.isCurrent(generation)) {
+                            changedFilesProvider.applyPreparedState(prepared);
+                        }
+                    } catch (error: unknown) {
+                        if (transitionCoordinator.isCurrent(generation)) {
+                            vscode.window.showErrorMessage(`Could not refresh comparison: ${errorMessage(error)}`);
+                        }
+                    }
+                    return;
+                }
                 vscode.window.showInformationMessage(
                     'No active review. Choose a review mode to create one.'
                 );
@@ -929,6 +964,34 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 }
             }
         }),
+        vscode.commands.registerCommand(
+            'localPrReview.goToFileComment',
+            async (argument?: FileChangeItem | vscode.Uri) => {
+                const uri = argument instanceof vscode.Uri
+                    ? argument
+                    : vscode.window.activeTextEditor?.document.uri;
+                const item = argument instanceof FileChangeItem ? argument
+                    : uri ? changedFilesProvider.getFileItemForUri(uri) : undefined;
+                if (!item || item.diffPlan !== changedFilesProvider.getDiffPlan()) {
+                    vscode.window.showInformationMessage('Open a file from the current review first.');
+                    return;
+                }
+                const thread = await commentController.pickFileComment(item.commentUri);
+                if (!thread?.range || item.diffPlan !== changedFilesProvider.getDiffPlan()) {
+                    return;
+                }
+                await vscode.commands.executeCommand('localPrReview.openDiff', item);
+                if (item.diffPlan !== changedFilesProvider.getDiffPlan()) {
+                    return;
+                }
+                thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+                const editor = vscode.window.visibleTextEditors.find(candidate =>
+                    candidate.document.uri.toString() === thread.uri.toString()
+                ) ?? await vscode.window.showTextDocument(thread.uri);
+                editor.selection = new vscode.Selection(thread.range.start, thread.range.start);
+                editor.revealRange(thread.range, vscode.TextEditorRevealType.InCenter);
+            }
+        ),
         vscode.commands.registerCommand(
             'localPrReview.openFile',
             async (item: FileChangeItem) => {
@@ -1433,6 +1496,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Activation can finish after Cursor has already cached an empty result for
     // the restored editor. Republish once after all asynchronous setup is done.
     workspaceCommentController.refreshCommentingRanges();
+    changedFilesProvider.fireChange();
+    // Do not expose mode buttons until their commands and startup state are ready.
+    context.subscriptions.push(vscode.window.registerWebviewViewProvider(
+        BranchSelectorWebviewProvider.viewType,
+        branchSelectorProvider
+    ));
 }
 
 async function addOrReply(

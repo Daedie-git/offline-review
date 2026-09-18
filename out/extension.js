@@ -116,7 +116,6 @@ async function activate(context) {
     catch {
         // Register independently so one optional tool cannot disable the other.
     }
-    context.subscriptions.push(vscode.window.registerWebviewViewProvider(branchSelectorWebviewProvider_1.BranchSelectorWebviewProvider.viewType, branchSelectorProvider));
     const changedFilesTreeView = vscode.window.createTreeView('localPrReview.changedFiles', {
         treeDataProvider: changedFilesProvider,
         manageCheckboxStateManually: true,
@@ -128,7 +127,11 @@ async function activate(context) {
                 changedFilesProvider.setFileReviewed(item.fileChange.filePath, state === vscode.TreeItemCheckboxState.Checked);
             }
         }
-    }), changedFilesTreeView, vscode.window.createTreeView('localPrReview.localPrs', {
+    }), changedFilesTreeView, changedFilesTreeView.onDidChangeVisibility(event => {
+        if (event.visible) {
+            changedFilesProvider.fireChange();
+        }
+    }), vscode.window.createTreeView('localPrReview.localPrs', {
         treeDataProvider: localPrsProvider,
     }), vscode.window.createTreeView('localPrReview.localComments', {
         treeDataProvider: localCommentsProvider,
@@ -142,6 +145,7 @@ async function activate(context) {
     // Every review switch/refresh runs through this generation. Preparation does
     // not mutate visible state; one synchronous apply publishes only the winner.
     let transitionRetryTimer;
+    let comparisonReview;
     const transitionToReview = async (review, options = {}, reservedGeneration) => {
         const generation = reservedGeneration ?? transitionCoordinator.beginTransition();
         if (!transitionCoordinator.isCurrent(generation)) {
@@ -177,7 +181,7 @@ async function activate(context) {
                         void transitionToReview(review, options, generation);
                     }
                 }, 100);
-                return false;
+                return 'pending';
             }
             if (!transitionCoordinator.isCurrent(generation)
                 || !transitionCoordinator.inputsAreCurrent(guarded.snapshot)) {
@@ -191,12 +195,15 @@ async function activate(context) {
                 || !transitionCoordinator.inputsAreCurrent(guarded.snapshot)) {
                 return false;
             }
-            localPrManager.setActiveReview(review.id);
+            if (!localPrManager.setActiveReview(review.id)) {
+                return false;
+            }
             reviewAnchorResolver.applyPreparedState(preparedComments);
             changedFilesProvider.applyPreparedState(prepared);
             if (prepared.plan.kind === 'branch') {
                 localPrManager.updateBranchReviewFallbackCommits(prepared.plan.reviewId, prepared.plan.baseCommit, prepared.plan.targetCommit);
             }
+            comparisonReview = localPrManager.getReviewById(review.id);
             commentController.setReviewableFiles(prepared.files.map(file => file.filePath), prepared.files
                 .filter(file => file.status === 'deleted')
                 .map(file => file.filePath));
@@ -217,19 +224,28 @@ async function activate(context) {
             return false;
         }
     };
-    const clearReviewUi = async (reservedGeneration) => {
+    const clearReviewUi = async (reservedGeneration, preserveComparison = false) => {
         const generation = reservedGeneration ?? transitionCoordinator.beginTransition();
         if (!transitionCoordinator.isCurrent(generation)) {
             return;
         }
         localPrManager.deactivateReview();
         reviewAnchorResolver.clear();
-        changedFilesProvider.clear();
+        if (preserveComparison) {
+            changedFilesProvider.clearReviewProgress();
+        }
+        else {
+            comparisonReview = undefined;
+            changedFilesProvider.clear();
+        }
         commentController.setReviewableFiles([]);
         commentController.loadAllThreads();
         localPrsProvider.refresh();
         localCommentsProvider.refresh();
         fileDecorationProvider.refresh();
+        if (preserveComparison) {
+            return;
+        }
         const currentBranch = await gitService.getCurrentBranch();
         if (transitionCoordinator.isCurrent(generation)) {
             branchSelectorProvider.setReviewState({
@@ -265,6 +281,9 @@ async function activate(context) {
         try {
             const review = await getOrCreateUncommittedReview(branch);
             const applied = await transitionToReview(review, { showError: !options.quiet }, generation);
+            if (applied === 'pending') {
+                return 'pending';
+            }
             if (!applied) {
                 return transitionCoordinator.isCurrent(generation) ? 'failed' : 'superseded';
             }
@@ -340,6 +359,9 @@ async function activate(context) {
             }
             const review = await getOrCreateBranchReview(base, branch);
             const applied = await transitionToReview(review, { showError: !options.quiet }, generation);
+            if (applied === 'pending') {
+                return 'pending';
+            }
             if (!applied) {
                 return transitionCoordinator.isCurrent(generation) ? 'failed' : 'superseded';
             }
@@ -633,7 +655,7 @@ async function activate(context) {
             const generation = transitionCoordinator.beginTransition();
             await storageService.withWatchSuppressed(async () => {
                 localPrManager.deleteReview(review.id);
-                await clearReviewUi(generation);
+                await clearReviewUi(generation, true);
             });
         }
         else {
@@ -661,7 +683,7 @@ async function activate(context) {
         const generation = transitionCoordinator.beginTransition();
         await storageService.withWatchSuppressed(async () => {
             localPrManager.deleteReview(active.id);
-            await clearReviewUi(generation);
+            await clearReviewUi(generation, true);
         });
         vscode.window.showInformationMessage('Active review cleared.');
     }), vscode.commands.registerCommand('localPrReview.clearAllReviews', async () => {
@@ -677,7 +699,7 @@ async function activate(context) {
         const generation = transitionCoordinator.beginTransition();
         await storageService.withWatchSuppressed(async () => {
             localPrManager.clearAllReviews();
-            await clearReviewUi(generation);
+            await clearReviewUi(generation, true);
         });
         vscode.window.showInformationMessage('All reviews and comments cleared.');
     }));
@@ -688,6 +710,23 @@ async function activate(context) {
         }
         const active = localPrManager.getActiveReview();
         if (!active) {
+            if (comparisonReview) {
+                const generation = transitionCoordinator.beginTransition();
+                try {
+                    const prepared = await changedFilesProvider.prepareRefresh({
+                        ...comparisonReview, reviewedFiles: [],
+                    });
+                    if (transitionCoordinator.isCurrent(generation)) {
+                        changedFilesProvider.applyPreparedState(prepared);
+                    }
+                }
+                catch (error) {
+                    if (transitionCoordinator.isCurrent(generation)) {
+                        vscode.window.showErrorMessage(`Could not refresh comparison: ${errorMessage(error)}`);
+                    }
+                }
+                return;
+            }
             vscode.window.showInformationMessage('No active review. Choose a review mode to create one.');
             return;
         }
@@ -714,6 +753,28 @@ async function activate(context) {
                 // Tree contents may have changed while expanding.
             }
         }
+    }), vscode.commands.registerCommand('localPrReview.goToFileComment', async (argument) => {
+        const uri = argument instanceof vscode.Uri
+            ? argument
+            : vscode.window.activeTextEditor?.document.uri;
+        const item = argument instanceof changedFilesProvider_1.FileChangeItem ? argument
+            : uri ? changedFilesProvider.getFileItemForUri(uri) : undefined;
+        if (!item || item.diffPlan !== changedFilesProvider.getDiffPlan()) {
+            vscode.window.showInformationMessage('Open a file from the current review first.');
+            return;
+        }
+        const thread = await commentController.pickFileComment(item.commentUri);
+        if (!thread?.range || item.diffPlan !== changedFilesProvider.getDiffPlan()) {
+            return;
+        }
+        await vscode.commands.executeCommand('localPrReview.openDiff', item);
+        if (item.diffPlan !== changedFilesProvider.getDiffPlan()) {
+            return;
+        }
+        thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+        const editor = vscode.window.visibleTextEditors.find(candidate => candidate.document.uri.toString() === thread.uri.toString()) ?? await vscode.window.showTextDocument(thread.uri);
+        editor.selection = new vscode.Selection(thread.range.start, thread.range.start);
+        editor.revealRange(thread.range, vscode.TextEditorRevealType.InCenter);
     }), vscode.commands.registerCommand('localPrReview.openFile', async (item) => {
         await vscode.window.showTextDocument(vscode.Uri.joinPath(vscode.Uri.file(item.diffPlan.worktreeRoot), item.fileChange.filePath));
     }), vscode.commands.registerCommand('localPrReview.openDiff', async (item) => {
@@ -1026,6 +1087,9 @@ async function activate(context) {
     // Activation can finish after Cursor has already cached an empty result for
     // the restored editor. Republish once after all asynchronous setup is done.
     workspaceCommentController.refreshCommentingRanges();
+    changedFilesProvider.fireChange();
+    // Do not expose mode buttons until their commands and startup state are ready.
+    context.subscriptions.push(vscode.window.registerWebviewViewProvider(branchSelectorWebviewProvider_1.BranchSelectorWebviewProvider.viewType, branchSelectorProvider));
 }
 async function addOrReply(controller, reply) {
     const thread = reply.thread;

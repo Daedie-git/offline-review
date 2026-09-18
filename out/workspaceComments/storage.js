@@ -583,14 +583,19 @@ class WorkspaceCommentStorage {
             if (!sameDirectoryIdentity(before, opened)) {
                 throw new Error('Workspace comments storage changed while it was being opened');
             }
-            const procPath = `/proc/self/fd/${descriptor}`;
-            if (!directoryPathHasIdentity(procPath, opened)) {
+            // Node exposes directory-relative paths through procfs only on Linux.
+            // Other hosts retain the opened identity and revalidate the canonical
+            // path around I/O; they cannot guarantee race-free directory traversal.
+            const operationPath = process.platform === 'linux'
+                ? `/proc/self/fd/${descriptor}`
+                : directoryPath;
+            if (!directoryPathHasIdentity(operationPath, opened)) {
                 throw new Error('Workspace comments storage requires a verified descriptor-bound path');
             }
             const directory = {
                 path: directoryPath,
                 descriptor,
-                operationPath: procPath,
+                operationPath,
                 dev: opened.dev,
                 ino: opened.ino,
                 ctimeMs: opened.ctimeMs,
@@ -794,7 +799,12 @@ function syncDirectoryStrict(directory) {
         fs.fsyncSync(directory.descriptor);
     }
     catch (error) {
-        throw new Error(`Workspace comments directory could not be synced: ${errorMessage(error)}`);
+        // Windows rejects flushing read-only directory handles. File contents
+        // are still fsynced, but directory-entry power-loss durability is weaker.
+        if (process.platform !== 'win32' || !(error instanceof Error)
+            || !('code' in error) || error.code !== 'EPERM') {
+            throw new Error(`Workspace comments directory could not be synced: ${errorMessage(error)}`);
+        }
     }
     directoryPathHasIdentityOrThrow(directory.operationPath, directory);
 }

@@ -2,7 +2,7 @@
   "name": "offline-review",
   "displayName": "Offline Review",
   "description": "Review diffs and annotate workspace code locally with offline inline comments — no remote needed.",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "publisher": "Daedie",
   "author": "Daedie",
   "icon": "resources/icon.png",
@@ -145,6 +145,11 @@
       ]
     },
     "commands": [
+      {
+        "command": "localPrReview.goToFileComment",
+        "title": "Offline Review: Go to Comment in File",
+        "icon": "$(comment-discussion)"
+      },
       {
         "command": "localPrReview.refreshComments",
         "title": "Refresh Comments",
@@ -312,6 +317,20 @@
       }
     ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "localPrReview.goToFileComment",
+          "when": "resourceScheme == git-local-review",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "localPrReview.goToFileComment",
+          "when": "resourceScheme == git-local-review || resourceScheme == file",
+          "group": "navigation"
+        }
+      ],
       "view/title": [
         {
           "command": "localPrReview.openAllDiffs",
@@ -355,6 +374,11 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "localPrReview.goToFileComment",
+          "when": "view == localPrReview.changedFiles && viewItem == fileChange",
+          "group": "inline@1"
+        },
         {
           "command": "localPrReview.deleteReview",
           "when": "view == localPrReview.localPrs",

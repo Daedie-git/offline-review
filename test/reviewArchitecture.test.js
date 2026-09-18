@@ -10,7 +10,7 @@ const { installVscodeMock, vscode } = require('./helpers/vscodeMock');
 
 const projectRoot = path.resolve(__dirname, '..');
 const compiledRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-review-test-build-'));
-execFileSync(path.join(projectRoot, 'node_modules', '.bin', 'tsc'), [
+execFileSync(process.execPath, [require.resolve('typescript/bin/tsc'),
     '-p', projectRoot,
     '--outDir', compiledRoot,
     '--declaration', 'false',
@@ -639,7 +639,195 @@ test('a superseded changed-files refresh cannot overwrite the latest review stat
     assert.equal(await slowRefresh, false);
     assert.equal(provider.getDiffPlan().reviewId, reviewB.id);
     assert.deepEqual(provider.getAllFilePaths(), ['fast.txt']);
+    // Actions must work even before the host requests the tree's children.
+    assert.equal(provider.getAllFileItems()[0].fileChange.filePath, 'fast.txt');
+    const sections = provider.getChildren();
+    assert.equal(provider.getChildren()[0], sections[0]);
+    assert.equal(provider.getAllExpandableItems()[0], sections[0]);
+    provider.fireChange();
+    assert.equal(provider.getAllFileItems()[0].fileChange.filePath, 'fast.txt');
+    provider.setFileReviewed('fast.txt', true);
+    provider.fireChange();
+    assert.equal(provider.getAllFileItems()[0].checkboxState, vscode.TreeItemCheckboxState.Checked);
+    const plan = provider.getDiffPlan();
+    const pendingRefresh = provider.refresh(reviewA);
+    provider.clearReviewProgress();
+    assert.equal(await pendingRefresh, false);
+    assert.equal(provider.getDiffPlan(), plan);
+    assert.deepEqual(provider.getAllFilePaths(), ['fast.txt']);
+    assert.deepEqual(provider.getPreparedState().reviewedFiles, []);
+    assert.equal(provider.getAllFileItems()[0].checkboxState, vscode.TreeItemCheckboxState.Unchecked);
     provider.dispose();
+});
+
+test('file comment picker is scoped, sorted, includes resolved threads and rejects stale selections', async () => {
+    installVscodeMock('/tmp/offline-review-picker');
+    const { ReviewCommentController } = built('comments/commentController');
+    const controller = new ReviewCommentController({}, {});
+    const uri = vscode.Uri.file('/tmp/selected.txt');
+    const makeThread = (line, state, body, target = uri) => ({
+        uri: target,
+        range: new vscode.Range(line, 0, line, 0),
+        state,
+        comments: [{ body }],
+        dispose() {},
+    });
+    const first = makeThread(2, vscode.CommentThreadState.Resolved, { value: 'First\ncomment' });
+    const last = makeThread(20, vscode.CommentThreadState.Unresolved, 'Last comment');
+    controller.threads.set('last', last);
+    controller.threads.set('other', makeThread(0, 0, 'Other', vscode.Uri.file('/tmp/other.txt')));
+    controller.threads.set('first', first);
+    const originalPicker = vscode.window.showQuickPick;
+    try {
+        vscode.window.showQuickPick = async items => {
+            assert.deepEqual(items.map(item => item.label), ['First comment', 'Last comment']);
+            assert.match(items[0].description, /Line 3 - resolved/);
+            return items[0];
+        };
+        assert.equal(await controller.pickFileComment(uri), first);
+        vscode.window.showQuickPick = async () => undefined;
+        assert.equal(await controller.pickFileComment(uri), undefined);
+        vscode.window.showQuickPick = async items => {
+            controller.loadAllThreads();
+            return items[0];
+        };
+        assert.equal(await controller.pickFileComment(uri), undefined);
+        vscode.window.showQuickPick = async () => assert.fail('Empty files must not open a picker');
+        assert.equal(await controller.pickFileComment(uri), undefined);
+    } finally {
+        vscode.window.showQuickPick = originalPicker;
+        controller.dispose();
+    }
+});
+
+test('activation retries survive startup and deleting reviews preserves a refreshable comparison', async () => {
+    const repository = temporaryDirectory('offline-review-activation-');
+    installVscodeMock(repository);
+    git(repository, 'init', '-b', 'main');
+    git(repository, 'config', 'user.name', 'Offline Review Test');
+    git(repository, 'config', 'user.email', 'offline-review@example.invalid');
+    write(repository, 'file.txt', 'base\n');
+    const base = commit(repository, 'base');
+    git(repository, 'checkout', '-b', 'feature');
+    write(repository, 'file.txt', 'changed\n');
+    const target = commit(repository, 'feature');
+    const { LocalPrManager } = built('services/localPrManager');
+    const manager = new LocalPrManager({
+        async getCommitHash(ref) { return ref === 'main' ? base : target; },
+    }, repository);
+    await manager.createBranchReview('main', 'feature');
+    manager.dispose();
+
+    const { GitService } = built('git/gitService');
+    const { ReviewTransitionCoordinator } = built('services/reviewTransitionCoordinator');
+    const originalPrepare = ReviewTransitionCoordinator.prototype.prepareStable;
+    const commands = new Map();
+    const trees = new Map();
+    const restorers = [];
+    const replace = (object, key, value) => {
+        const previous = object[key];
+        object[key] = value;
+        restorers.push(() => { object[key] = previous; });
+    };
+    const disposable = () => new vscode.Disposable();
+    replace(GitService.prototype, 'initialize', async function () {
+        await this.initializeLocalWorktreeRoot();
+        return true;
+    });
+    let preparations = 0;
+    replace(ReviewTransitionCoordinator.prototype, 'prepareStable', function (options) {
+        return ++preparations === 1
+            ? Promise.resolve({ status: 'retry', attempts: 3 })
+            : originalPrepare.call(this, options);
+    });
+    replace(vscode, 'RelativePattern', class {});
+    replace(vscode.commands, 'registerCommand', (name, handler) => {
+        commands.set(name, handler);
+        return disposable();
+    });
+    replace(vscode.window, 'registerFileDecorationProvider', disposable);
+    replace(vscode.window, 'onDidChangeActiveTextEditor', disposable);
+    replace(vscode.window, 'createTreeView', (name, options) => {
+        trees.set(name, options.treeDataProvider);
+        return { dispose() {}, onDidChangeCheckboxState: disposable, onDidChangeVisibility: disposable };
+    });
+    replace(vscode.window, 'registerWebviewViewProvider', () => {
+        assert.ok(commands.has('localPrReview.reviewActiveBranch'));
+        return disposable();
+    });
+    replace(vscode.workspace, 'registerTextDocumentContentProvider', disposable);
+    replace(vscode.workspace, 'onDidSaveTextDocument', disposable);
+    replace(vscode.workspace, 'createFileSystemWatcher', () => ({
+        dispose() {}, onDidChange: disposable, onDidCreate: disposable, onDidDelete: disposable,
+    }));
+    replace(vscode.window, 'showWarningMessage', async (_message, _options, choice) => choice);
+    const context = { subscriptions: [], extensionUri: vscode.Uri.file(projectRoot) };
+    try {
+        await built('extension').activate(context);
+        const provider = trees.get('localPrReview.changedFiles');
+        const deadline = Date.now() + 5000;
+        while (!provider.getDiffPlan() && Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        assert.deepEqual(provider.getAllFilePaths(), ['file.txt']);
+        for (const command of ['deleteReview', 'clearActiveReview', 'clearAllReviews']) {
+            provider.setFileReviewed('file.txt', true);
+            const plan = provider.getDiffPlan();
+            await commands.get(`localPrReview.${command}`)();
+            assert.equal(provider.getDiffPlan(), plan);
+            assert.deepEqual(provider.getAllFilePaths(), ['file.txt']);
+            assert.deepEqual(provider.getPreparedState().reviewedFiles, []);
+            const registryPath = path.join(repository, '.vscode/offline-reviews/registry.json');
+            assert.deepEqual(JSON.parse(fs.readFileSync(registryPath, 'utf8')).reviews, []);
+            await commands.get('localPrReview.refreshFiles')();
+            assert.deepEqual(provider.getAllFilePaths(), ['file.txt']);
+            assert.deepEqual(JSON.parse(fs.readFileSync(registryPath, 'utf8')).reviews, []);
+            await commands.get('localPrReview.reviewActiveBranch')();
+        }
+
+        write(repository, 'file.txt', 'local change\n');
+        await commands.get('localPrReview.reviewUncommitted')();
+        const oldItem = provider.getAllFileItems()[0];
+        replace(vscode.workspace, 'textDocuments', [{
+            uri: oldItem.rightUri,
+            lineCount: 2,
+            lineAt(line) { return { text: line === 0 ? 'local change' : '' }; },
+        }]);
+        await commands.get('localPrReview.addComment')({
+            thread: { uri: oldItem.rightUri, range: new vscode.Range(0, 0, 0, 0), comments: [], dispose() {} },
+            text: 'navigate after refresh',
+        });
+        await commands.get('localPrReview.refreshFiles')();
+        const currentItem = provider.getAllFileItems()[0];
+        assert.notEqual(currentItem.rightUri.toString(), oldItem.rightUri.toString());
+        replace(vscode.window, 'activeTextEditor', { document: { uri: oldItem.rightUri } });
+        let picked = false;
+        replace(vscode.window, 'showQuickPick', async items => {
+            assert.equal(items[0].label, 'navigate after refresh');
+            picked = true;
+            return items[0];
+        });
+        let revealed;
+        replace(vscode.window, 'visibleTextEditors', [{
+            document: { uri: currentItem.rightUri },
+            revealRange(range) { revealed = range; },
+        }]);
+        const diffs = [];
+        replace(vscode.commands, 'executeCommand', async (command, ...args) => {
+            if (command === 'vscode.diff') {
+                diffs.push(args);
+                return;
+            }
+            return commands.get(command)(...args);
+        });
+        await commands.get('localPrReview.goToFileComment')();
+        assert.equal(picked, true);
+        assert.equal(diffs[0][1].toString(), currentItem.rightUri.toString());
+        assert.equal(revealed.start.line, 0);
+    } finally {
+        for (const subscription of context.subscriptions.reverse()) subscription.dispose();
+        for (const restore of restorers.reverse()) restore();
+    }
 });
 
 test('worktree URIs carry prepared identity and file refresh invalidates every matching open document', async () => {
@@ -657,7 +845,7 @@ test('worktree URIs carry prepared identity and file refresh invalidates every m
     const planA = '99999999-9999-4999-8999-999999999999';
     const planB = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
     const planC = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
-    const worktreeRoot = '/tmp/offline-review-uri-test';
+    const worktreeRoot = path.resolve('/tmp/offline-review-uri-test');
     const uriA = getDiffDocumentUri(
         { kind: 'worktree', reviewId: reviewA, headCommit: headA, planId: planA, worktreeRoot },
         'src/file.txt',
@@ -755,7 +943,7 @@ test('worktree URIs carry prepared identity and file refresh invalidates every m
 });
 
 test('virtual language navigation safely restores matching branch snapshots', async () => {
-    const workspace = '/tmp/offline-review-language-test';
+    const workspace = path.resolve('/tmp/offline-review-language-test');
     installVscodeMock(workspace);
     const { getDiffDocumentUri } = built('git/gitService');
     const { registerVirtualDocLanguageFeatures } = built(

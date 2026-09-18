@@ -11,7 +11,7 @@ const { installVscodeMock, vscode } = require('./helpers/vscodeMock');
 
 const projectRoot = path.resolve(__dirname, '..');
 const compiledRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-reanchor-gaps-build-'));
-execFileSync(path.join(projectRoot, 'node_modules', '.bin', 'tsc'), [
+execFileSync(process.execPath, [require.resolve('typescript/bin/tsc'),
     '-p', projectRoot, '--outDir', compiledRoot,
     '--declaration', 'false', '--sourceMap', 'false',
 ], { cwd: projectRoot, stdio: 'pipe' });

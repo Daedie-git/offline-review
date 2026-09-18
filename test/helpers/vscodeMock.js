@@ -157,6 +157,8 @@ const vscode = {
     Uri,
     Position,
     Range,
+    Selection: class Selection extends Range {},
+    TextEditorRevealType: { Default: 0, InCenter: 1, InCenterIfOutsideViewport: 2 },
     MarkdownString,
     LanguageModelTextPart,
     LanguageModelToolResult,
